@@ -1,0 +1,111 @@
+{
+  "projectType": "infrastructure",
+  "projectName": "CloudGaming",
+  "projectDescription": "Low-latency P2P cloud gaming and remote desktop platform with WebRTC streaming",
+  "theme": "aspen",
+  "primaryColor": "#00ff88",
+  "lightColor": "#00cc6a",
+  "darkColor": "#00ff88",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "architecture"
+            ]
+          },
+          {
+            "group": "Deployment",
+            "pages": [
+              "deployment/overview",
+              "deployment/host-setup",
+              "deployment/signaling-server",
+              "deployment/matchmaker",
+              "deployment/client"
+            ]
+          },
+          {
+            "group": "Components",
+            "pages": [
+              "components/host",
+              "components/signaling-server",
+              "components/matchmaker",
+              "components/client"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "configuration/overview",
+              "configuration/video",
+              "configuration/audio",
+              "configuration/input",
+              "configuration/capture",
+              "configuration/network"
+            ]
+          },
+          {
+            "group": "Operations",
+            "pages": [
+              "operations/monitoring",
+              "operations/performance-tuning",
+              "operations/troubleshooting"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Matchmaking API",
+            "pages": [
+              "api/matchmaking/overview",
+              "api/matchmaking/host-endpoints",
+              "api/matchmaking/client-endpoints"
+            ]
+          },
+          {
+            "group": "WebRTC Signaling",
+            "pages": [
+              "api/signaling/protocol",
+              "api/signaling/messages"
+            ]
+          },
+          {
+            "group": "Data Channels",
+            "pages": [
+              "api/data-channels/input",
+              "api/data-channels/feedback"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Ultra-low latency streaming (<40ms)",
+    "Hardware-accelerated video encoding (NVENC/QSV/AMF)",
+    "P2P WebRTC connections",
+    "Redis-based signaling with horizontal scaling",
+    "Automatic matchmaking system",
+    "Process-specific audio capture",
+    "Adaptive bitrate control",
+    "Real-time input injection"
+  ],
+  "publicApiSurface": [
+    "POST /api/host/heartbeat",
+    "POST /api/host/status",
+    "POST /api/match/find",
+    "WebSocket signaling protocol",
+    "keyPressChannel DataChannel",
+    "mouseChannel DataChannel",
+    "videoFeedbackChannel DataChannel",
+    "latencyChannel DataChannel"
+  ]
+}
