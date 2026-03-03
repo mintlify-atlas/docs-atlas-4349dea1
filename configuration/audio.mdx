@@ -1,0 +1,388 @@
+---
+title: Audio Configuration
+description: Configure audio capture, Opus encoding, WASAPI settings, and latency optimization
+---
+
+## Overview
+
+The `host.audio` section controls audio capture from the target process or system, Opus encoding parameters, WASAPI configuration, and latency optimization.
+
+## Process-Specific Audio Capture
+
+Capture audio only from the target process instead of all system audio (requires Windows 11+).
+
+<ParamField path="audio.processLoopback.enabled" type="boolean" default="true">
+  Enable process-specific loopback audio capture.
+  
+  **Default:** `true`
+  
+  When enabled, only audio from the target process is captured. When disabled, all system audio is captured.
+  
+  <Warning>Requires Windows 11 or later. Falls back to system audio capture on older Windows versions.</Warning>
+</ParamField>
+
+<ParamField path="audio.processLoopback.includeProcessTree" type="boolean" default="true">
+  Include audio from child processes of the target.
+  
+  **Default:** `true`
+  
+  Useful when the main application spawns child processes that also produce audio.
+</ParamField>
+
+## Opus Encoding
+
+<ParamField path="audio.bitrate" type="integer" default="80000">
+  Opus encoding bitrate in bits per second.
+  
+  **Default:** `80000` (80 kbps)
+  
+  **Recommended ranges:**
+  - `64000` (64 kbps) - Minimum quality
+  - `80000` (80 kbps) - Good quality (default)
+  - `128000` (128 kbps) - High quality
+  - `192000` (192 kbps) - Maximum quality
+  
+  <Tip>80 kbps provides excellent quality for most use cases. Increase for music-focused applications.</Tip>
+</ParamField>
+
+<ParamField path="audio.complexity" type="integer" default="6">
+  Opus encoder computational complexity.
+  
+  **Default:** `6`
+  
+  **Range:** `0` (lowest CPU) to `10` (highest CPU)
+  
+  Higher values improve quality at the same bitrate but use more CPU.
+</ParamField>
+
+<ParamField path="audio.application" type="integer" default="2049">
+  Opus application type.
+  
+  **Default:** `2049` (OPUS_APPLICATION_AUDIO)
+  
+  **Options:**
+  - `2048` - VOIP (optimized for speech)
+  - `2049` - AUDIO (general purpose, music)
+  - `2051` - RESTRICTED_LOWDELAY (lowest latency)
+</ParamField>
+
+<ParamField path="audio.channels" type="integer" default="2">
+  Number of audio channels.
+  
+  **Default:** `2` (stereo)
+  
+  - `1` - Mono
+  - `2` - Stereo
+</ParamField>
+
+<ParamField path="audio.frameSizeMs" type="integer" default="10">
+  Opus frame size in milliseconds.
+  
+  **Default:** `10` ms
+  
+  **Options:** `2.5`, `5`, `10`, `20`, `40`, `60`
+  
+  Smaller values reduce latency but increase overhead. `10` ms is optimal for low-latency streaming.
+</ParamField>
+
+## Error Resilience
+
+<ParamField path="audio.enableFec" type="boolean" default="true">
+  Enable Forward Error Correction (FEC) in Opus encoder.
+  
+  **Default:** `true`
+  
+  FEC embeds redundant data to recover from packet loss. Slightly increases bitrate.
+  
+  <Tip>Keep enabled for network streaming. Only disable on perfect local networks.</Tip>
+</ParamField>
+
+<ParamField path="audio.expectedLossPerc" type="integer" default="5">
+  Expected packet loss percentage for FEC tuning.
+  
+  **Default:** `5` (%)
+  
+  Higher values increase FEC overhead but improve resilience.
+</ParamField>
+
+<ParamField path="audio.enableDtx" type="boolean" default="false">
+  Enable Discontinuous Transmission (DTX).
+  
+  **Default:** `false`
+  
+  Reduces bitrate during silence by not encoding silent frames. Can cause audio artifacts in gaming.
+</ParamField>
+
+## WASAPI Configuration
+
+Windows Audio Session API (WASAPI) settings for low-level audio capture.
+
+<ParamField path="audio.wasapi.preferExclusiveMode" type="boolean" default="false">
+  Prefer WASAPI exclusive mode.
+  
+  **Default:** `false`
+  
+  Exclusive mode provides lower latency but prevents other applications from using the audio device.
+  
+  <Warning>May conflict with other audio applications. Only enable if you need absolute minimum latency.</Warning>
+</ParamField>
+
+<ParamField path="audio.wasapi.enforceEventDriven" type="boolean" default="true">
+  Use event-driven WASAPI mode.
+  
+  **Default:** `true`
+  
+  Event-driven mode is more efficient than polling and provides lower latency.
+</ParamField>
+
+<ParamField path="audio.wasapi.devicePeriodMs" type="float" default="5.0">
+  Target device period in milliseconds.
+  
+  **Default:** `5.0` ms
+  
+  Lower values reduce latency but increase CPU usage and risk of audio glitches.
+</ParamField>
+
+<ParamField path="audio.wasapi.fallbackPeriodMs" type="float" default="10.0">
+  Fallback period if target period is not supported.
+  
+  **Default:** `10.0` ms
+</ParamField>
+
+<ParamField path="audio.wasapi.force48kHzStereo" type="boolean" default="true">
+  Force 48 kHz stereo capture format.
+  
+  **Default:** `true`
+  
+  48 kHz is optimal for Opus encoding. Resampling occurs if source is different.
+</ParamField>
+
+<ParamField path="audio.wasapi.preferLinearResampling" type="boolean" default="true">
+  Use linear resampling instead of higher quality algorithms.
+  
+  **Default:** `true`
+  
+  Linear resampling has lower latency. Set to `false` for better quality at cost of latency.
+</ParamField>
+
+<ParamField path="audio.wasapi.useDmoOnlyForHighQuality" type="boolean" default="false">
+  Only use DirectX Media Objects (DMO) for high-quality resampling.
+  
+  **Default:** `false`
+</ParamField>
+
+## Latency Optimization
+
+Advanced latency tuning for ultra-low-latency scenarios.
+
+<ParamField path="audio.latency.enforceSingleFrameBuffering" type="boolean" default="true">
+  Minimize buffering to single frame.
+  
+  **Default:** `true`
+  
+  Reduces latency but requires consistent system performance.
+</ParamField>
+
+<ParamField path="audio.latency.maxFrameSizeMs" type="integer" default="10">
+  Maximum frame size in milliseconds.
+  
+  **Default:** `10` ms
+  
+  Should match `frameSizeMs` for lowest latency.
+</ParamField>
+
+<ParamField path="audio.latency.minFrameSizeMs" type="integer" default="10">
+  Minimum frame size in milliseconds.
+  
+  **Default:** `10` ms
+</ParamField>
+
+<ParamField path="audio.latency.strictLatencyMode" type="boolean" default="false">
+  Enable strict latency mode with aggressive buffering reduction.
+  
+  **Default:** `false`
+  
+  <Warning>May cause audio glitches on slower systems. Only enable for ultra-low-latency requirements.</Warning>
+</ParamField>
+
+<ParamField path="audio.latency.warnOnBuffering" type="boolean" default="true">
+  Log warnings when buffering exceeds target.
+  
+  **Default:** `true`
+  
+  Useful for diagnosing audio latency issues.
+</ParamField>
+
+<ParamField path="audio.latency.targetOneWayLatencyMs" type="integer" default="40">
+  Target one-way audio latency in milliseconds.
+  
+  **Default:** `40` ms
+  
+  End-to-end latency target including capture, encode, network, and decode.
+</ParamField>
+
+<ParamField path="audio.latency.ultraLowLatencyProfile" type="boolean" default="false">
+  Enable ultra-low-latency profile with all optimizations.
+  
+  **Default:** `false`
+  
+  Applies aggressive settings for minimum latency. May reduce quality.
+</ParamField>
+
+<ParamField path="audio.latency.disableFecInLowLatency" type="boolean" default="false">
+  Disable FEC in ultra-low-latency mode.
+  
+  **Default:** `false`
+  
+  Trades error resilience for lower latency.
+</ParamField>
+
+## Adaptive Bitrate Control
+
+Dynamic audio bitrate adjustment based on network conditions.
+
+<ParamField path="audio.bitrateAdaptation.enabled" type="boolean" default="true">
+  Enable adaptive audio bitrate control.
+  
+  **Default:** `true`
+  
+  Automatically adjusts bitrate based on packet loss and network quality.
+</ParamField>
+
+<ParamField path="audio.bitrateAdaptation.minBitrate" type="integer" default="64000">
+  Minimum bitrate in bps.
+  
+  **Default:** `64000` (64 kbps)
+</ParamField>
+
+<ParamField path="audio.bitrateAdaptation.maxBitrate" type="integer" default="128000">
+  Maximum bitrate in bps.
+  
+  **Default:** `128000` (128 kbps)
+</ParamField>
+
+<ParamField path="audio.bitrateAdaptation.decreaseCooldownMs" type="integer" default="2000">
+  Cooldown period after bitrate decrease.
+  
+  **Default:** `2000` ms
+</ParamField>
+
+<ParamField path="audio.bitrateAdaptation.increaseIntervalMs" type="integer" default="10000">
+  Interval between bitrate increases.
+  
+  **Default:** `10000` ms
+</ParamField>
+
+<ParamField path="audio.bitrateAdaptation.increaseStep" type="integer" default="8000">
+  Bitrate increase step size in bps.
+  
+  **Default:** `8000` (8 kbps)
+</ParamField>
+
+<ParamField path="audio.bitrateAdaptation.highLossThreshold" type="float" default="0.05">
+  Packet loss threshold to trigger bitrate decrease.
+  
+  **Default:** `0.05` (5%)
+</ParamField>
+
+<ParamField path="audio.bitrateAdaptation.lowLossThreshold" type="float" default="0.01">
+  Packet loss threshold to allow bitrate increase.
+  
+  **Default:** `0.01` (1%)
+</ParamField>
+
+<ParamField path="audio.bitrateAdaptation.cleanSamplesRequired" type="integer" default="30">
+  Number of clean samples before increasing bitrate.
+  
+  **Default:** `30`
+</ParamField>
+
+<ParamField path="audio.bitrateAdaptation.fecEnableThreshold" type="float" default="0.03">
+  Packet loss threshold to enable FEC.
+  
+  **Default:** `0.03` (3%)
+</ParamField>
+
+<ParamField path="audio.bitrateAdaptation.fecDisableThreshold" type="float" default="0.005">
+  Packet loss threshold to disable FEC.
+  
+  **Default:** `0.005` (0.5%)
+</ParamField>
+
+## Threading
+
+<ParamField path="audio.useThreadAffinity" type="boolean" default="false">
+  Pin audio encoder thread to specific CPU cores.
+  
+  **Default:** `false`
+</ParamField>
+
+<ParamField path="audio.encoderThreadAffinityMask" type="integer" default="0">
+  CPU affinity mask for encoder thread (bitmask of CPU cores).
+  
+  **Default:** `0` (no affinity)
+  
+  Example: `0x0F` pins to first 4 cores.
+</ParamField>
+
+## Example Configurations
+
+### Low Latency Gaming
+
+```json
+{
+  "audio": {
+    "processLoopback": {
+      "enabled": true,
+      "includeProcessTree": true
+    },
+    "bitrate": 64000,
+    "complexity": 4,
+    "frameSizeMs": 10,
+    "enableFec": true,
+    "latency": {
+      "enforceSingleFrameBuffering": true,
+      "strictLatencyMode": true,
+      "ultraLowLatencyProfile": true
+    }
+  }
+}
+```
+
+### High Quality Music Streaming
+
+```json
+{
+  "audio": {
+    "processLoopback": {
+      "enabled": true
+    },
+    "bitrate": 128000,
+    "complexity": 10,
+    "frameSizeMs": 20,
+    "enableFec": true,
+    "bitrateAdaptation": {
+      "enabled": true,
+      "minBitrate": 96000,
+      "maxBitrate": 192000
+    }
+  }
+}
+```
+
+### Unreliable Network
+
+```json
+{
+  "audio": {
+    "bitrate": 80000,
+    "enableFec": true,
+    "expectedLossPerc": 10,
+    "bitrateAdaptation": {
+      "enabled": true,
+      "highLossThreshold": 0.08,
+      "fecEnableThreshold": 0.02
+    }
+  }
+}
+```

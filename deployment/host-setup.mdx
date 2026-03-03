@@ -1,0 +1,442 @@
+---
+title: Windows Host Setup
+description: Build and deploy the Windows host application that captures and streams games
+---
+
+## Overview
+
+The Windows host is a C++/Go application that:
+
+- Captures video using Windows Graphics Capture (WGC)
+- Encodes video with FFmpeg hardware acceleration (NVENC/QSV/AMF)
+- Captures audio via WASAPI
+- Streams media over WebRTC using Pion
+- Receives input from clients via WebRTC DataChannels
+
+## Requirements
+
+### System Requirements
+
+<Warning>
+Windows 10 version 1903 (May 2019 Update) or later is required for WGC support.
+</Warning>
+
+- **OS**: Windows 10 (1903+) or Windows 11
+- **CPU**: Modern multi-core processor (4+ cores recommended)
+- **GPU**: NVIDIA (GTX 900+ series), Intel (6th gen+), or AMD with hardware encoding
+- **RAM**: 4 GB minimum, 8+ GB recommended
+- **Network**: Low-latency connection (5+ Mbps upload per stream)
+
+### Development Tools
+
+- **Visual Studio 2019 or 2022**
+  - Desktop development with C++ workload
+  - Windows 10 SDK (10.0.17134.0 or later)
+  - Platform Toolset v141, v142, or v143
+- **Go 1.19 or later** (for WebRTC stack)
+- **FFmpeg** with hardware encoding support
+
+## Building the Host
+
+<Steps>
+
+<Step title="Clone the repository">
+```bash
+git clone <repository-url>
+cd source
+```
+</Step>
+
+<Step title="Open the Visual Studio solution">
+Open `DisplayCaptureProject.sln` in Visual Studio.
+
+The project supports multiple configurations:
+- **Debug|x64**: Development build with debug symbols
+- **Release|x64**: Optimized production build
+
+<Note>
+Only x64 (64-bit) builds are supported. Win32 (32-bit) is not supported.
+</Note>
+</Step>
+
+<Step title="Restore NuGet packages">
+Visual Studio should automatically restore the required packages:
+
+- `Microsoft.Windows.CppWinRT` (2.0.220531.1)
+- Windows 10 SDK references
+
+If packages don't restore automatically:
+```
+Right-click solution → Restore NuGet Packages
+```
+</Step>
+
+<Step title="Build the solution">
+```
+Build → Build Solution (Ctrl+Shift+B)
+```
+
+Or from the command line:
+```bash
+msbuild DisplayCaptureProject.sln /p:Configuration=Release /p:Platform=x64
+```
+
+The executable will be output to:
+- Debug: `x64\Debug\DisplayCaptureProject.exe`
+- Release: `x64\Release\DisplayCaptureProject.exe`
+</Step>
+
+</Steps>
+
+## Configuration
+
+### config.json Setup
+
+The host reads configuration from a `config.json` file that must be placed in the same directory as the executable.
+
+<CodeGroup>
+
+```json Local Development
+{
+  "host": {
+    "targetProcessName": "YourGame.exe",
+    "signalingUrl": "ws://localhost:3002",
+    "matchmaker": {
+      "url": "http://localhost:3000",
+      "hostSecret": "HELLO-MFS",
+      "heartbeatIntervalMs": 20000
+    },
+    "window": {
+      "resizeClientArea": true,
+      "targetWidth": 1920,
+      "targetHeight": 1080
+    },
+    "video": {
+      "fps": 60,
+      "bitrateStart": 8000000,
+      "bitrateMin": 8000000,
+      "bitrateMax": 12000000,
+      "preset": "p2",
+      "rc": "cbr"
+    },
+    "audio": {
+      "processLoopback": {
+        "enabled": true,
+        "includeProcessTree": true
+      },
+      "bitrate": 80000
+    },
+    "input": {
+      "blockWinKeys": true,
+      "releaseAllOnDisconnect": true,
+      "injectionPolicy": "REQUIRE_FOREGROUND"
+    }
+  }
+}
+```
+
+```json Production
+{
+  "host": {
+    "targetProcessName": "YourGame.exe",
+    "signalingUrl": "wss://signaling.yourdomain.com",
+    "matchmaker": {
+      "url": "https://matchmaker.yourdomain.com",
+      "hostSecret": "YOUR-SECURE-SECRET-HERE",
+      "heartbeatIntervalMs": 20000
+    },
+    "window": {
+      "resizeClientArea": true,
+      "targetWidth": 1920,
+      "targetHeight": 1080
+    },
+    "video": {
+      "fps": 60,
+      "pacingFixedUs": 16666,
+      "bitrateStart": 8000000,
+      "bitrateMin": 6000000,
+      "bitrateMax": 15000000,
+      "preset": "p4",
+      "rc": "vbr",
+      "fullRange": false
+    },
+    "capture": {
+      "cursor": false,
+      "skipUnchanged": true,
+      "mmcss": { "enable": true, "priority": 4 }
+    },
+    "audio": {
+      "processLoopback": {
+        "enabled": true,
+        "includeProcessTree": true
+      },
+      "bitrate": 80000,
+      "enableFec": true,
+      "complexity": 6
+    },
+    "input": {
+      "blockWinKeys": true,
+      "blockSystemKeys": false,
+      "releaseAllOnDisconnect": true,
+      "injectionPolicy": "REQUIRE_FOREGROUND",
+      "maxInjectHz": 10000
+    }
+  }
+}
+```
+
+</CodeGroup>
+
+### Key Configuration Options
+
+#### Host Settings
+
+| Field | Type | Description | Default |
+|-------|------|-------------|----------|
+| `targetProcessName` | string | Name of the game/application to capture | Required |
+| `signalingUrl` | string | WebSocket URL of signaling server | Required |
+| `matchmaker.url` | string | HTTP URL of matchmaker service | Required |
+| `matchmaker.hostSecret` | string | Shared secret for host authentication | `HELLO-MFS` |
+| `matchmaker.heartbeatIntervalMs` | number | Heartbeat interval to matchmaker (ms) | `20000` |
+
+#### Window Settings
+
+| Field | Type | Description | Default |
+|-------|------|-------------|----------|
+| `window.resizeClientArea` | boolean | Resize game window to target dimensions | `true` |
+| `window.targetWidth` | number | Target window width | `1920` |
+| `window.targetHeight` | number | Target window height | `1080` |
+
+#### Video Encoding
+
+| Field | Type | Description | Default |
+|-------|------|-------------|----------|
+| `video.fps` | number | Target framerate | `60` |
+| `video.bitrateStart` | number | Initial bitrate (bps) | `8000000` |
+| `video.bitrateMin` | number | Minimum bitrate for ABR (bps) | `8000000` |
+| `video.bitrateMax` | number | Maximum bitrate for ABR (bps) | `12000000` |
+| `video.preset` | string | NVENC preset (`p1`-`p7`, lower=faster) | `p2` |
+| `video.rc` | string | Rate control mode (`cbr`, `vbr`) | `cbr` |
+| `video.bf` | number | B-frames (0 for lowest latency) | `0` |
+
+<Note>
+For ultra-low latency: use `preset: "p1"`, `rc: "cbr"`, `bf: 0`
+
+For better quality at higher latency: use `preset: "p4"`, `rc: "vbr"`, `bf: 2`
+</Note>
+
+#### Audio Capture
+
+| Field | Type | Description | Default |
+|-------|------|-------------|----------|
+| `audio.processLoopback.enabled` | boolean | Capture only target process audio (Win11+) | `false` |
+| `audio.bitrate` | number | Opus bitrate (bps) | `80000` |
+| `audio.enableFec` | boolean | Enable forward error correction | `true` |
+| `audio.complexity` | number | Opus complexity (0-10) | `6` |
+
+#### Input Injection
+
+| Field | Type | Description | Default |
+|-------|------|-------------|----------|
+| `input.blockWinKeys` | boolean | Block Windows key during session | `true` |
+| `input.releaseAllOnDisconnect` | boolean | Release all keys on disconnect | `true` |
+| `input.injectionPolicy` | string | `REQUIRE_FOREGROUND` or `ALLOW_BACKGROUND` | `REQUIRE_FOREGROUND` |
+| `input.maxInjectHz` | number | Max input rate (events/sec) | `10000` |
+
+## Running the Host
+
+<Steps>
+
+<Step title="Start the game or application">
+Launch the target application specified in `config.json` as `targetProcessName`.
+
+```bash
+# Example
+.\YourGame.exe
+```
+</Step>
+
+<Step title="Run the host executable">
+Ensure `config.json` is in the same directory, then run:
+
+```bash
+cd x64\Release
+.\DisplayCaptureProject.exe
+```
+
+The host will:
+1. Connect to the matchmaker and register itself
+2. Send heartbeats every 20 seconds
+3. Wait for client connections
+4. Begin capturing and streaming when a client connects
+</Step>
+
+</Steps>
+
+### Startup Logs
+
+You should see output similar to:
+
+```
+[INFO] Loading config.json
+[INFO] Target process: YourGame.exe
+[INFO] Connecting to matchmaker: http://localhost:3000
+[INFO] Registered with matchmaker, hostId: abc-123-def
+[INFO] Connected to signaling server: ws://localhost:3002
+[INFO] Waiting for client connection...
+```
+
+## Troubleshooting
+
+### Build Errors
+
+<AccordionGroup>
+
+<Accordion title="Error: Windows SDK not found">
+**Solution**: Install the Windows 10 SDK via Visual Studio Installer
+
+```
+Visual Studio Installer → Modify → Individual Components
+→ Search "Windows 10 SDK" → Select latest version → Modify
+```
+
+The project requires Windows SDK 10.0.17134.0 or later.
+</Accordion>
+
+<Accordion title="Error: C++/WinRT package not found">
+**Solution**: Restore NuGet packages
+
+```bash
+# From Visual Studio
+Tools → NuGet Package Manager → Package Manager Console
+Update-Package -reinstall
+
+# Or from command line
+nuget restore DisplayCaptureProject.sln
+```
+</Accordion>
+
+<Accordion title="Error: Cannot open include file 'winrt/...'">
+**Solution**: The CppWinRT package is not properly installed
+
+```
+1. Delete the 'packages' folder
+2. Right-click solution → Restore NuGet Packages
+3. Clean and rebuild solution
+```
+</Accordion>
+
+</AccordionGroup>
+
+### Runtime Errors
+
+<AccordionGroup>
+
+<Accordion title="Error: Target process not found">
+The host cannot find the game executable specified in `targetProcessName`.
+
+**Solutions**:
+- Ensure the process name matches exactly (case-sensitive)
+- Launch the game before starting the host
+- Use Task Manager to verify the exact process name
+- For UWP games, use the package family name
+</Accordion>
+
+<Accordion title="Error: Failed to connect to matchmaker">
+**Solutions**:
+- Verify the matchmaker is running
+- Check `matchmaker.url` in config.json
+- Verify `hostSecret` matches the matchmaker's `HOST_SECRET`
+- Check firewall rules
+</Accordion>
+
+<Accordion title="Error: Graphics capture failed">
+WGC (Windows Graphics Capture) initialization failed.
+
+**Solutions**:
+- Update Windows to version 1903 or later
+- Update GPU drivers
+- Enable "Graphics Capture" in Windows Settings
+- Run as Administrator if capturing elevated processes
+</Accordion>
+
+<Accordion title="Error: Hardware encoder not available">
+FFmpeg cannot initialize NVENC/QSV/AMF.
+
+**Solutions**:
+- Update GPU drivers
+- Verify GPU supports hardware encoding:
+  - NVIDIA: GTX 900 series or newer
+  - Intel: 6th gen (Skylake) or newer
+  - AMD: VCE 1.0 or newer
+- Check GPU is not fully utilized by other applications
+</Accordion>
+
+<Accordion title="Performance: High CPU usage">
+**Solutions**:
+- Lower `video.fps` (try 30 instead of 60)
+- Use faster NVENC preset (`p1` or `p2`)
+- Reduce resolution in `window.targetWidth/Height`
+- Enable `capture.skipUnchanged: true`
+- Set `capture.mmcss.enable: true` for thread priority boost
+</Accordion>
+
+<Accordion title="Performance: High latency">
+**Solutions**:
+- Use CBR rate control: `video.rc: "cbr"`
+- Disable B-frames: `video.bf: 0`
+- Use fastest preset: `video.preset: "p1"`
+- Reduce `video.pacingFixedUs` for faster frame pacing
+- Enable `audio.latency.strictLatencyMode: true`
+</Accordion>
+
+</AccordionGroup>
+
+## Production Deployment
+
+### Running as a Windows Service
+
+For production, run the host as a Windows service using NSSM or similar:
+
+```bash
+# Install NSSM
+choco install nssm
+
+# Create service
+nssm install CloudGamingHost "C:\path\to\DisplayCaptureProject.exe"
+nssm set CloudGamingHost AppDirectory "C:\path\to"
+nssm set CloudGamingHost DisplayName "CloudGaming Host Service"
+nssm set CloudGamingHost Start SERVICE_AUTO_START
+
+# Start service
+nssm start CloudGamingHost
+```
+
+### Security Hardening
+
+<Warning>
+For production deployments:
+
+- Run the host in a dedicated user account with minimal permissions
+- Use Windows Firewall to restrict outbound connections
+- Change `hostSecret` to a strong random value
+- Use WSS (secure WebSocket) for signaling
+- Monitor logs for suspicious activity
+- Keep Windows and GPU drivers updated
+</Warning>
+
+### Monitoring
+
+Key metrics to monitor:
+
+- **CPU usage**: Should be under 50% for good performance
+- **GPU usage**: Encoder should be under 80%
+- **Network upload**: Matches configured bitrate
+- **Frame drops**: Should be near zero
+- **Matchmaker heartbeats**: Should succeed every 20 seconds
+
+## Next Steps
+
+- [Signaling Server Deployment](/deployment/signaling-server) - Set up the WebRTC signaling infrastructure
+- [Matchmaker Deployment](/deployment/matchmaker) - Configure host registration service
+- [Client Deployment](/deployment/client) - Deploy the browser client

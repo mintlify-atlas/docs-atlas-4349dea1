@@ -1,0 +1,1041 @@
+---
+title: 'Troubleshooting'
+description: 'Common issues and solutions for CloudGaming deployment'
+---
+
+## Overview
+
+This guide covers common issues, their causes, and solutions based on actual implementation details from the CloudGaming source code.
+
+## Connection Issues
+
+<Accordion title="Client fails to connect to signaling server">
+
+**Symptoms:**
+- WebSocket connection fails
+- Browser console shows connection refused
+- No WebSocket upgrade occurring
+
+**Common Causes:**
+
+1. **Wrong URL or port**
+   ```bash
+   # Check signaling server is running
+   curl http://localhost:3002/healthz
+   # Should return: ok
+   ```
+
+2. **CORS blocking connection**
+   ```javascript
+   // Server/mm_server/Matchmaker.js:88-92
+   res.setHeader('Access-Control-Allow-Origin', '*');
+   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+   ```
+   Verify CORS headers are present in response.
+
+3. **WSS required in production**
+   ```javascript
+   // Server/ScalableSignalingServer.js:199-202
+   if (config.requireWss && request.headers['x-forwarded-proto'] !== 'https') {
+       ws.close(1008, 'WSS required');
+   }
+   ```
+   Use `wss://` URL in production, not `ws://`.
+
+4. **Invalid roomId**
+   ```javascript
+   // Server/ScalableSignalingServer.js:129-133
+   const ROOM_ID_REGEX = /^[A-Za-z0-9_\-:.]+$/;
+   if (typeof roomId !== 'string' || roomId.length > config.roomIdMaxLength) {
+       // Connection rejected
+   }
+   ```
+   Room IDs must be alphanumeric with `_`, `-`, `:`, `.` only.
+
+**Solutions:**
+
+```javascript
+// Correct client connection
+const signalingUrl = 'wss://your-server.com';
+const roomId = 'game-room-1';  // Valid format
+const ws = new WebSocket(`${signalingUrl}?roomId=${roomId}`);
+```
+
+**Logs to Check:**
+```bash
+grep "connection" signaling.log
+grep "Invalid roomId" signaling.log
+```
+
+</Accordion>
+
+<Accordion title="ICE connection fails or times out">
+
+**Symptoms:**
+- ICE connection state stuck in `checking`
+- No ICE candidates generated
+- Connection timeout after 30 seconds
+
+**Common Causes:**
+
+1. **TURN server not configured**
+   ```bash
+   # Check environment variables
+   echo $PION_TURN_URL
+   echo $PION_TURN_USERNAME
+   echo $PION_TURN_CREDENTIAL
+   ```
+
+2. **Firewall blocking UDP**
+   ```bash
+   # Test UDP connectivity to TURN server
+   nc -u turn.example.com 3478
+   ```
+
+3. **STUN timeout**
+   ```javascript
+   // Default STUN server
+   { urls: 'stun:stun.l.google.com:19302' }
+   ```
+   Try alternative STUN servers if Google STUN is blocked.
+
+4. **Symmetric NAT**
+   - Requires TURN relay
+   - Host/srflx candidates won't work
+
+**Solutions:**
+
+```bash
+# Configure TURN server
+export PION_TURN_URL="turn:turn.example.com:3478"
+export PION_TURN_USERNAME="username"
+export PION_TURN_CREDENTIAL="password"
+
+# Or use multiple TURN servers
+export PION_TURN_URLS="turn:us-west.example.com:3478,turn:us-east.example.com:3478"
+```
+
+**Debug ICE candidates:**
+```javascript
+peerConnection.onicecandidate = (event) => {
+    if (event.candidate) {
+        console.log('ICE candidate type:', event.candidate.type);
+        console.log('ICE candidate:', event.candidate.candidate);
+    }
+};
+```
+
+Expected types:
+- `host` - Direct connection (best)
+- `srflx` - Server reflexive via STUN (good)
+- `relay` - Via TURN relay (fallback)
+
+**Verify ICE gathering:**
+```bash
+# Should see candidates in logs
+grep "Local ICE Candidate" client.log
+```
+
+</Accordion>
+
+<Accordion title="Redis connection failures">
+
+**Symptoms:**
+- Signaling server shows Redis errors
+- Circuit breaker opens
+- `503 Service Unavailable` responses
+
+**Common Causes:**
+
+1. **Redis server not running**
+   ```bash
+   redis-cli ping
+   # Should return: PONG
+   ```
+
+2. **Connection string incorrect**
+   ```javascript
+   // Check config.js
+   const config = {
+       redisUrl: process.env.REDIS_URL || 'redis://localhost:6379'
+   };
+   ```
+
+3. **Circuit breaker triggered**
+   ```javascript
+   // Server/ScalableSignalingServer.js:68-76
+   if (redisFailureCount >= config.cbErrorThreshold) {
+       redisCircuitOpenUntil = Date.now() + config.cbOpenMs;
+   }
+   ```
+   Circuit opens after threshold failures.
+
+**Solutions:**
+
+```bash
+# Check Redis connectivity
+redis-cli -h your-redis-host -p 6379 ping
+
+# Check Redis logs
+redis-cli info replication
+
+# Monitor Redis connection
+curl http://localhost:3002/metrics | grep signaling_redis_up
+# Should show: signaling_redis_up 1
+```
+
+**Restart with fresh connection:**
+```bash
+# Flush any stuck connections
+redis-cli CLIENT KILL TYPE normal
+
+# Restart signaling server
+node Server/ScalableSignalingServer.js
+```
+
+**Check circuit breaker status:**
+```bash
+curl http://localhost:3002/metrics | grep circuit_breaker
+# signaling_circuit_breaker_open 0  (should be 0)
+```
+
+</Accordion>
+
+## Audio Issues
+
+<Accordion title="No audio playing on client">
+
+**Symptoms:**
+- Video works but no audio
+- Audio track present but silent
+- No audio RTP packets received
+
+**Common Causes:**
+
+1. **Audio track not added to peer connection**
+   ```javascript
+   // Verify audio track in SDP
+   console.log(answer.sdp);
+   // Should contain: m=audio ...
+   ```
+
+2. **Opus codec not negotiated**
+   ```javascript
+   // Check SDP for Opus
+   // Should have: a=rtpmap:111 opus/48000/2
+   ```
+
+3. **Audio capture not enabled**
+   ```json
+   // config.json
+   {
+     "audio": {
+       "processLoopback": {
+         "enabled": true,  // Must be true
+         "includeProcessTree": true
+       }
+     }
+   }
+   ```
+
+4. **WASAPI initialization failure**
+   - Audio device not found
+   - Exclusive mode failed
+   - Format not supported
+
+**Solutions:**
+
+```bash
+# Check audio packets being sent
+grep "AUDIO" host.log | grep "Frame"
+# Should see:
+# [Go/Pion] AUDIO RECEIVE: Frame 2500, size=320 bytes, has_data=true
+```
+
+**Verify audio track:**
+```javascript
+peerConnection.ontrack = (event) => {
+    if (event.track.kind === 'audio') {
+        console.log('Audio track received:', event.track.id);
+        const audioElement = document.getElementById('remoteAudio');
+        audioElement.srcObject = event.streams[0];
+    }
+};
+```
+
+**Check audio RTP state:**
+```bash
+grep "Audio RTP baseline" host.log
+# Should see:
+# [Go/Pion] Audio RTP baseline established: PTS=12345 us -> RTP=12345
+```
+
+**Debug WASAPI:**
+```json
+{
+  "audio": {
+    "wasapi": {
+      "preferExclusiveMode": false,  // Try shared mode first
+      "enforceEventDriven": true,
+      "devicePeriodMs": 10.0  // Increase if 5.0 fails
+    }
+  }
+}
+```
+
+</Accordion>
+
+<Accordion title="Audio latency too high">
+
+**Symptoms:**
+- Audio lags behind video
+- Echo or delay in audio
+- Latency > 100ms
+
+**Common Causes:**
+
+1. **Large frame size**
+   ```json
+   {
+     "audio": {
+       "frameSizeMs": 20  // Too large for low latency
+     }
+   }
+   ```
+
+2. **Buffering enabled**
+   ```json
+   {
+     "audio": {
+       "latency": {
+         "enforceSingleFrameBuffering": false  // Should be true
+       }
+     }
+   }
+   ```
+
+3. **Audio queue congestion**
+   ```bash
+   grep "Audio Queue Health" host.log
+   # If shows WARNING or CRITICAL:
+   # [Go/Pion] Audio Queue Health [WARNING]: avg=2.4
+   ```
+
+**Solutions:**
+
+```json
+// Low-latency audio config
+{
+  "audio": {
+    "frameSizeMs": 10,
+    "latency": {
+      "enforceSingleFrameBuffering": true,
+      "targetOneWayLatencyMs": 40,
+      "strictLatencyMode": true
+    },
+    "wasapi": {
+      "devicePeriodMs": 5.0
+    }
+  }
+}
+```
+
+**Monitor queue health:**
+```bash
+grep "Audio Queue Health" host.log
+# Target: [GOOD]: avg < 2.0
+```
+
+**Check bitrate adaptation:**
+```json
+{
+  "audio": {
+    "bitrateAdaptation": {
+      "enabled": true,
+      "minBitrate": 64000  // Allow reduction if congested
+    }
+  }
+}
+```
+
+</Accordion>
+
+<Accordion title="Audio crackling or distortion">
+
+**Symptoms:**
+- Popping or clicking sounds
+- Robotic audio
+- Intermittent audio gaps
+
+**Common Causes:**
+
+1. **Buffer underruns**
+   - Frame size too small
+   - CPU overload
+   - Packet loss
+
+2. **FEC disabled with high loss**
+   ```json
+   {
+     "audio": {
+       "enableFec": false,  // Should be true
+       "expectedLossPerc": 5
+     }
+   }
+   ```
+
+3. **Opus complexity too high**
+   ```json
+   {
+     "audio": {
+       "complexity": 10  // Max complexity, high CPU
+     }
+   }
+   ```
+
+**Solutions:**
+
+```json
+// Robust audio config
+{
+  "audio": {
+    "frameSizeMs": 10,  // Balance latency/stability
+    "complexity": 6,    // Moderate complexity
+    "enableFec": true,  // Enable FEC
+    "expectedLossPerc": 5,
+    "bitrateAdaptation": {
+      "enabled": true,
+      "fecEnableThreshold": 0.03  // Enable at 3% loss
+    }
+  }
+}
+```
+
+**Check packet loss:**
+```bash
+grep "WebRTC Stats" host.log
+# Look for: loss=X%
+# Target: <2% loss
+```
+
+**Increase frame size if crackling:**
+```json
+{
+  "audio": {
+    "frameSizeMs": 20  // More stable but higher latency
+  }
+}
+```
+
+</Accordion>
+
+## Video Issues
+
+<Accordion title="Video not displaying">
+
+**Symptoms:**
+- Black screen
+- Video element not playing
+- No video track received
+
+**Common Causes:**
+
+1. **Codec mismatch**
+   ```javascript
+   // Check SDP for H.264
+   console.log(offer.sdp);
+   // Should contain: a=rtpmap:96 H264/90000
+   ```
+
+2. **Track not attached to video element**
+   ```javascript
+   peerConnection.ontrack = (event) => {
+       if (event.track.kind === 'video') {
+           videoElement.srcObject = event.streams[0];
+           videoElement.play();  // Must call play()
+       }
+   };
+   ```
+
+3. **NVENC initialization failed**
+   - NVIDIA GPU not found
+   - Driver too old
+   - NVENC not supported on GPU
+
+4. **Capture source not available**
+   - Game process not running
+   - Window not found
+   - Desktop capture failed
+
+**Solutions:**
+
+```javascript
+// Proper video element setup
+const videoElement = document.getElementById('remoteVideo');
+videoElement.autoplay = true;
+videoElement.playsInline = true;
+videoElement.muted = true;  // Required for autoplay in some browsers
+
+peerConnection.ontrack = (event) => {
+    if (event.track.kind === 'video') {
+        console.log('Video track received');
+        videoElement.srcObject = event.streams[0];
+    }
+};
+```
+
+**Check video packets:**
+```bash
+grep "video" host.log | grep -i "sample\|frame"
+# Should see frames being sent
+```
+
+**Verify NVENC:**
+```bash
+nvidia-smi
+# Check GPU is detected and driver version
+```
+
+**Debug capture:**
+```json
+{
+  "host": {
+    "targetProcessName": "YourGame.exe",  // Verify process name
+    "window": {
+      "resizeClientArea": true,
+      "targetWidth": 1920,
+      "targetHeight": 1080
+    }
+  }
+}
+```
+
+</Accordion>
+
+<Accordion title="High video latency">
+
+**Symptoms:**
+- Glass-to-glass latency > 100ms
+- Noticeable input lag
+- Video feels sluggish
+
+**Common Causes:**
+
+1. **Encoder preset too slow**
+   ```json
+   {
+     "video": {
+       "preset": "p4"  // p4-p7 are too slow for real-time
+     }
+   }
+   ```
+
+2. **B-frames enabled**
+   ```json
+   {
+     "video": {
+       "bf": 2  // B-frames add latency
+     }
+   }
+   ```
+
+3. **Queue depth too high**
+   ```json
+   {
+     "capture": {
+       "maxQueueDepth": 4  // Should be 1-2 for low latency
+     }
+   }
+   ```
+
+4. **Network congestion**
+   ```bash
+   grep "RTT" host.log
+   # High RTT indicates network issues
+   ```
+
+**Solutions:**
+
+```json
+// Low-latency video config
+{
+  "video": {
+    "preset": "p1",    // Fastest preset
+    "rc": "cbr",       // Constant bitrate
+    "bf": 0,           // No B-frames
+    "rcLookahead": 0,  // No lookahead
+    "asyncDepth": 1    // Minimal async pipeline
+  },
+  "capture": {
+    "maxQueueDepth": 1,
+    "framePoolBuffers": 2
+  }
+}
+```
+
+**Monitor encoder latency:**
+```bash
+grep "encode" host.log | grep -i "latency\|duration"
+# Target: <5ms per frame
+```
+
+**Check pacer queue:**
+```bash
+grep "pacer" host.log
+# Queue should stay near 0-1
+```
+
+</Accordion>
+
+<Accordion title="Poor video quality or artifacts">
+
+**Symptoms:**
+- Blocky video
+- Compression artifacts
+- Blurry motion
+- Pixelation
+
+**Common Causes:**
+
+1. **Bitrate too low**
+   ```json
+   {
+     "video": {
+       "bitrateStart": 4000000  // 4 Mbps too low for 1080p
+     }
+   }
+   ```
+
+2. **Preset too fast**
+   ```json
+   {
+     "video": {
+       "preset": "p1"  // Fastest but lowest quality
+     }
+   }
+   ```
+
+3. **Packet loss**
+   ```bash
+   grep "WebRTC Stats" host.log | grep "loss"
+   # High packet loss degrades quality
+   ```
+
+4. **PLI (Picture Loss Indication) threshold too low**
+   ```json
+   {
+     "video": {
+       "minPliLossThreshold": 0.05  // Too aggressive
+     }
+   }
+   ```
+
+**Solutions:**
+
+```json
+// High-quality video config
+{
+  "video": {
+    "bitrateStart": 10000000,  // 10 Mbps
+    "bitrateMin": 8000000,
+    "bitrateMax": 15000000,
+    "preset": "p3",           // Better quality
+    "rc": "vbr_hq",           // High-quality VBR
+    "minPliLossThreshold": 0.15  // Less aggressive keyframes
+  }
+}
+```
+
+**Enable FEC for video (if supported):**
+```bash
+grep "nack\|pli" host.log
+# Monitor retransmission requests
+```
+
+**Check bitrate adaptation:**
+```bash
+grep "bitrate" host.log
+# Verify bitrate is not being reduced too aggressively
+```
+
+</Accordion>
+
+## Host Registration Issues
+
+<Accordion title="Host heartbeat failing">
+
+**Symptoms:**
+- Host shows as offline in matchmaker
+- Clients can't find host
+- 401/403 errors on heartbeat
+
+**Common Causes:**
+
+1. **Invalid or missing host secret**
+   ```bash
+   # Check authorization header
+   curl -X POST http://localhost:8080/api/host/heartbeat \
+     -H "Authorization: Bearer WRONG_SECRET" \
+     -H "Content-Type: application/json" \
+     -d '{"hostId": "test", "roomId": "room1"}'
+   # Returns: {"success": false, "error": "Forbidden: Invalid host secret"}
+   ```
+
+2. **Incorrect heartbeat payload**
+   ```json
+   // Missing required fields
+   {
+     "hostId": "...",  // Required
+     "roomId": "..."   // Required
+     // region, status, capacity are optional
+   }
+   ```
+
+3. **Redis disconnected**
+   ```bash
+   # Check matchmaker Redis connection
+   redis-cli ping
+   ```
+
+4. **Heartbeat interval too slow**
+   ```json
+   {
+     "matchmaker": {
+       "heartbeatIntervalMs": 30000  // Should be < 30000 (TTL)
+     }
+   }
+   ```
+
+**Solutions:**
+
+```bash
+# Verify host secret matches
+echo $HOST_SECRET
+# Should match config.json:
+```
+
+```json
+{
+  "host": {
+    "matchmaker": {
+      "hostSecret": "HELLO-MFS",  // Must match
+      "heartbeatIntervalMs": 20000  // Send every 20s (TTL is 30s)
+    }
+  }
+}
+```
+
+**Test heartbeat manually:**
+```bash
+curl -X POST http://localhost:8080/api/host/heartbeat \
+  -H "Authorization: Bearer HELLO-MFS" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "hostId": "550e8400-e29b-41d4-a716-446655440000",
+    "roomId": "game-room-1",
+    "region": "us-west",
+    "status": "idle",
+    "capacity": 1,
+    "availableSlots": 1
+  }'
+# Should return: {"success": true, "ttl": 30}
+```
+
+**Check host TTL:**
+```bash
+curl http://localhost:8080/api/hosts/ttl
+# Shows remaining TTL for each host
+```
+
+**Monitor stale host pruning:**
+```bash
+grep "Pruned stale" matchmaker.log
+# Stale hosts are pruned every 10s
+```
+
+</Accordion>
+
+<Accordion title="Clients can't find available hosts">
+
+**Symptoms:**
+- Match API returns 404
+- "No hosts available" message
+- Hosts registered but not discoverable
+
+**Common Causes:**
+
+1. **Host status not 'idle'**
+   ```json
+   // Host heartbeat shows:
+   {
+     "status": "busy",      // Should be "idle"
+     "availableSlots": 0     // Should be > 0
+   }
+   ```
+
+2. **Region mismatch**
+   ```bash
+   # Client requests specific region
+   curl -X POST http://localhost:8080/api/match/find \
+     -d '{"region": "eu-west"}'
+   # But all hosts are in "us-west"
+   ```
+
+3. **Hosts expired (TTL reached)**
+   ```bash
+   # Check host TTLs
+   curl http://localhost:8080/api/hosts/ttl
+   # All TTLs should be > 0
+   ```
+
+4. **Race condition in allocation**
+   ```bash
+   grep "Allocation race" matchmaker.log
+   # Multiple clients trying to allocate same host
+   ```
+
+**Solutions:**
+
+```bash
+# List all hosts
+curl http://localhost:8080/api/hosts
+# Should show idle hosts with availableSlots > 0
+```
+
+**Verify host configuration:**
+```json
+{
+  "matchmaker": {
+    "heartbeatIntervalMs": 20000,  // < 30s TTL
+    "url": "http://localhost:8080",
+    "hostSecret": "HELLO-MFS"
+  }
+}
+```
+
+**Test match without region:**
+```bash
+curl -X POST http://localhost:8080/api/match/find \
+  -H "Content-Type: application/json" \
+  -d '{}'
+# Should find any available host regardless of region
+```
+
+**Check idle_hosts set:**
+```bash
+redis-cli SMEMBERS idle_hosts
+# Should list host IDs
+
+redis-cli GET host:550e8400-e29b-41d4-a716-446655440000
+# Should show host details with availableSlots > 0
+```
+
+**Monitor allocation races:**
+```bash
+grep -E "Allocation race|Transaction results" matchmaker.log
+# Race conditions are retried automatically
+```
+
+</Accordion>
+
+## Performance Issues
+
+<Accordion title="High CPU usage">
+
+**Symptoms:**
+- CPU usage > 80% sustained
+- Frame drops
+- System unresponsive
+
+**Common Causes:**
+
+1. **Opus complexity too high**
+   ```json
+   {
+     "audio": {
+       "complexity": 10  // Max CPU usage
+     }
+   }
+   ```
+
+2. **Small audio frames**
+   ```json
+   {
+     "audio": {
+       "frameSizeMs": 5  // 200 packets/sec, high overhead
+     }
+   }
+   ```
+
+3. **Video preset too slow**
+   ```json
+   {
+     "video": {
+       "preset": "p7"  // Slowest preset
+     }
+   }
+   ```
+
+4. **GC pressure from buffer churn**
+   ```bash
+   grep "Buffer pool" host.log | grep "hit rate"
+   # Low hit rate = frequent allocations
+   ```
+
+**Solutions:**
+
+```json
+// CPU-optimized config
+{
+  "audio": {
+    "complexity": 6,      // Balanced
+    "frameSizeMs": 10     // Standard frame size
+  },
+  "video": {
+    "preset": "p2",       // Fast preset
+    "asyncDepth": 2       // Pipeline encoding
+  }
+}
+```
+
+**Disable unused features:**
+```json
+{
+  "capture": {
+    "cursor": false,           // No cursor overlay
+    "skipUnchanged": true      // Skip duplicate frames
+  },
+  "video": {
+    "gpuTiming": false         // No GPU timing overhead
+  }
+}
+```
+
+**Monitor buffer pool:**
+```bash
+grep "Buffer Pool Statistics" host.log
+# Target: >95% hit rate
+```
+
+</Accordion>
+
+<Accordion title="High memory usage">
+
+**Symptoms:**
+- Memory usage growing over time
+- Out of memory errors
+- System swapping
+
+**Common Causes:**
+
+1. **Buffer pool leaks**
+   ```bash
+   grep "Buffer pool" host.log
+   # Check for anomalies in allocation counts
+   ```
+
+2. **GC not aggressive enough**
+   ```go
+   // gortc_main/main.go:1301
+   debug.SetGCPercent(150)  // May hold too much memory
+   ```
+
+3. **Large video frame buffers**
+   ```json
+   {
+     "capture": {
+       "copyPoolSize": 6,       // Large pool
+       "framePoolBuffers": 4    // Many frame buffers
+     }
+   }
+   ```
+
+**Solutions:**
+
+```go
+// More aggressive GC
+debug.SetGCPercent(100)  // GC at 2x heap instead of 2.5x
+```
+
+```json
+// Reduce buffer pools
+{
+  "capture": {
+    "copyPoolSize": 2,
+    "framePoolBuffers": 2
+  },
+  "video": {
+    "hwFramePoolSize": 2  // Reduce hardware frame pool
+  }
+}
+```
+
+**Monitor memory:**
+```bash
+# Check buffer pool health
+grep "Buffer Pool Health" host.log
+
+# Watch memory usage
+watch -n 1 'ps aux | grep gortc'
+```
+
+</Accordion>
+
+## Diagnostic Commands
+
+### Quick Health Check
+
+```bash
+# Signaling server health
+curl http://localhost:3002/healthz
+curl http://localhost:3002/readyz
+curl http://localhost:3002/metrics
+
+# Matchmaker health
+curl http://localhost:8080/healthz
+curl http://localhost:8080/api/hosts
+curl http://localhost:8080/api/hosts/ttl
+
+# Redis health
+redis-cli ping
+redis-cli INFO stats
+redis-cli CLIENT LIST
+```
+
+### Log Analysis
+
+```bash
+# WebRTC stats
+grep "WebRTC Stats" host.log | tail -20
+
+# Audio health
+grep "Audio Queue Health" host.log | tail -10
+
+# Connection issues
+grep -E "error|failed|timeout" signaling.log
+
+# Performance metrics
+grep -E "Buffer Pool|latency" host.log | tail -50
+```
+
+### Network Diagnostics
+
+```bash
+# Test TURN connectivity
+telnet turn.example.com 3478
+
+# Test STUN
+nc -u stun.l.google.com 19302
+
+# Check RTT to signaling server
+ping -c 10 your-signaling-server.com
+
+# Monitor bandwidth
+iftop -i eth0
+```
+
+## Next Steps
+
+- [Monitoring](/operations/monitoring) - Set up comprehensive monitoring
+- [Performance Tuning](/operations/performance-tuning) - Optimize for your use case
+- [GitHub Issues](https://github.com/your-repo/issues) - Report bugs or request features

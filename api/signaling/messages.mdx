@@ -1,0 +1,659 @@
+---
+title: 'Signaling Message Types'
+description: 'Complete reference for WebRTC signaling message schemas and examples'
+---
+
+## Overview
+
+The CloudGaming signaling protocol uses JSON messages over WebSocket to coordinate WebRTC connections. All messages are validated using Zod schemas before being forwarded to peers.
+
+## Message Validation
+
+The server validates all incoming messages against strict schemas. Invalid messages are:
+
+1. Dropped silently
+2. Logged with warning level
+3. Trigger a `schema-error` control message to the sender
+4. Increment the `signaling_schema_rejects_total` metric
+
+**Non-JSON messages** are rejected immediately and not processed.
+
+## Message Types
+
+The protocol supports four primary message types:
+
+- **offer** - WebRTC session description (SDP offer)
+- **answer** - WebRTC session description (SDP answer)
+- **candidate** - ICE candidate for connection establishment
+- **control** - Server control messages
+
+## Offer Message
+
+Sent by the host to initiate a WebRTC connection with a peer.
+
+### Schema
+
+```typescript
+interface OfferMessage {
+  type: 'offer';
+  sdp: string;  // Minimum length: 1
+}
+```
+
+### Validation Rules
+
+- `type` must be exactly `"offer"`
+- `sdp` must be a non-empty string
+- `sdp` should be valid SDP format (starts with `v=`)
+
+### Example
+
+```json
+{
+  "type": "offer",
+  "sdp": "v=0\r\no=- 123456789 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\na=extmap-allow-mixed\r\na=msid-semantic: WMS stream\r\nm=video 9 UDP/TLS/RTP/SAVPF 96 97\r\nc=IN IP4 0.0.0.0\r\na=rtcp:9 IN IP4 0.0.0.0\r\na=ice-ufrag:abc\r\na=ice-pwd:def\r\na=ice-options:trickle\r\na=fingerprint:sha-256 AA:BB:CC:DD...\r\na=setup:actpass\r\na=mid:0\r\na=sendrecv\r\na=rtcp-mux\r\na=rtpmap:96 VP8/90000\r\na=rtpmap:97 H264/90000\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=rtcp:9 IN IP4 0.0.0.0\r\na=ice-ufrag:abc\r\na=ice-pwd:def\r\na=ice-options:trickle\r\na=fingerprint:sha-256 AA:BB:CC:DD...\r\na=setup:actpass\r\na=mid:1\r\na=sendrecv\r\na=rtcp-mux\r\na=rtpmap:111 opus/48000/2"
+}
+```
+
+### Usage
+
+**Client-side (JavaScript):**
+```javascript
+const peerConnection = new RTCPeerConnection(config);
+const offer = await peerConnection.createOffer();
+await peerConnection.setLocalDescription(offer);
+
+// Send to signaling server
+ws.send(JSON.stringify({
+  type: 'offer',
+  sdp: offer.sdp
+}));
+```
+
+**Server behavior:**
+- Validates message schema
+- Publishes to Redis: `room:ROOM_ID`
+- Forwards to all peers in room (except sender)
+- Logs: `"Received from server: { type: offer, sdp: '...', candidate: undefined }"`
+
+## Answer Message
+
+Sent by the client in response to an offer.
+
+### Schema
+
+```typescript
+interface AnswerMessage {
+  type: 'answer';
+  sdp: string;  // Minimum length: 1
+}
+```
+
+### Validation Rules
+
+- `type` must be exactly `"answer"`
+- `sdp` must be a non-empty string
+- `sdp` should be valid SDP format (starts with `v=`)
+
+### Example
+
+```json
+{
+  "type": "answer",
+  "sdp": "v=0\r\no=- 987654321 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\na=extmap-allow-mixed\r\na=msid-semantic: WMS stream\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\nc=IN IP4 0.0.0.0\r\na=rtcp:9 IN IP4 0.0.0.0\r\na=ice-ufrag:ghi\r\na=ice-pwd:jkl\r\na=ice-options:trickle\r\na=fingerprint:sha-256 EE:FF:00:11...\r\na=setup:active\r\na=mid:0\r\na=sendrecv\r\na=rtcp-mux\r\na=rtpmap:96 VP8/90000\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=rtcp:9 IN IP4 0.0.0.0\r\na=ice-ufrag:ghi\r\na=ice-pwd:jkl\r\na=ice-options:trickle\r\na=fingerprint:sha-256 EE:FF:00:11...\r\na=setup:active\r\na=mid:1\r\na=sendrecv\r\na=rtcp-mux\r\na=rtpmap:111 opus/48000/2"
+}
+```
+
+### Usage
+
+**Client-side (JavaScript):**
+```javascript
+ws.onmessage = async (event) => {
+  const msg = JSON.parse(event.data);
+  
+  if (msg.type === 'offer') {
+    await peerConnection.setRemoteDescription(
+      new RTCSessionDescription({ type: 'offer', sdp: msg.sdp })
+    );
+    
+    const answer = await peerConnection.createAnswer();
+    await peerConnection.setLocalDescription(answer);
+    
+    // Send answer to signaling server
+    ws.send(JSON.stringify({
+      type: 'answer',
+      sdp: answer.sdp
+    }));
+  }
+};
+```
+
+**Server behavior:**
+- Validates message schema
+- Publishes to Redis: `room:ROOM_ID`
+- Forwards to all peers in room (except sender)
+- Typically forwarded to the original offer sender
+
+## Candidate Message
+
+Sends ICE candidates for NAT traversal and connection establishment.
+
+### Schema
+
+```typescript
+interface CandidateMessage {
+  type: 'candidate';
+  candidate: string;        // Minimum length: 1
+  sdpMid?: string;         // Optional SDP media ID
+  sdpMLineIndex?: number;  // Optional SDP m-line index (>= 0)
+}
+```
+
+### Validation Rules
+
+- `type` must be exactly `"candidate"`
+- `candidate` must be a non-empty string
+- `sdpMid` is optional string
+- `sdpMLineIndex` is optional non-negative integer
+
+### Example
+
+**Host candidate:**
+```json
+{
+  "type": "candidate",
+  "candidate": "candidate:1 1 udp 2130706431 192.168.1.100 54321 typ host",
+  "sdpMid": "0",
+  "sdpMLineIndex": 0
+}
+```
+
+**Server reflexive candidate:**
+```json
+{
+  "type": "candidate",
+  "candidate": "candidate:2 1 udp 1694498815 203.0.113.45 12345 typ srflx raddr 192.168.1.100 rport 54321",
+  "sdpMid": "0",
+  "sdpMLineIndex": 0
+}
+```
+
+**Relay candidate (TURN):**
+```json
+{
+  "type": "candidate",
+  "candidate": "candidate:3 1 udp 16777215 198.51.100.20 23456 typ relay raddr 203.0.113.45 rport 12345",
+  "sdpMid": "1",
+  "sdpMLineIndex": 1
+}
+```
+
+**End of candidates signal:**
+```json
+{
+  "type": "candidate",
+  "candidate": "",
+  "sdpMid": null,
+  "sdpMLineIndex": null
+}
+```
+
+### ICE Candidate Types
+
+| Type | Description | Priority | Use Case |
+|------|-------------|----------|----------|
+| `host` | Local network address | Highest | Direct LAN connections |
+| `srflx` | Server reflexive (STUN) | Medium | NAT traversal |
+| `prflx` | Peer reflexive | Medium | Discovered during checks |
+| `relay` | TURN relay server | Lowest | Fallback for restrictive NATs |
+
+### Usage
+
+**Client-side (JavaScript):**
+```javascript
+peerConnection.onicecandidate = (event) => {
+  if (event.candidate) {
+    // Send ICE candidate to signaling server
+    ws.send(JSON.stringify({
+      type: 'candidate',
+      candidate: event.candidate.candidate,
+      sdpMid: event.candidate.sdpMid,
+      sdpMLineIndex: event.candidate.sdpMLineIndex
+    }));
+  } else {
+    // ICE gathering complete (optional signal)
+    console.log('ICE gathering complete');
+  }
+};
+
+// Receiving candidates
+ws.onmessage = async (event) => {
+  const msg = JSON.parse(event.data);
+  
+  if (msg.type === 'candidate') {
+    if (msg.candidate) {
+      await peerConnection.addIceCandidate(
+        new RTCIceCandidate({
+          candidate: msg.candidate,
+          sdpMid: msg.sdpMid,
+          sdpMLineIndex: msg.sdpMLineIndex
+        })
+      );
+    }
+  }
+};
+```
+
+**Server behavior:**
+- Validates message schema
+- Publishes to Redis: `room:ROOM_ID`
+- Forwards to all peers in room (except sender)
+- Empty candidate string is valid (end-of-candidates)
+
+### Legacy `ice-candidate` Format
+
+The client also supports an older format for backwards compatibility:
+
+```json
+{
+  "type": "ice-candidate",
+  "candidate": {
+    "candidate": "candidate:1 1 udp 2130706431 192.168.1.100 54321 typ host",
+    "sdpMid": "0",
+    "sdpMLineIndex": 0
+  }
+}
+```
+
+<Warning>
+The `ice-candidate` format is **not validated by the server schema**. Use the `candidate` format for proper validation.
+</Warning>
+
+## Control Messages
+
+Server-to-client control and informational messages.
+
+### Schema
+
+```typescript
+interface ControlMessage {
+  type: 'control';
+  action: string;      // Minimum length: 1
+  payload?: unknown;   // Optional arbitrary data
+}
+```
+
+### Validation Rules
+
+- `type` must be exactly `"control"`
+- `action` must be a non-empty string
+- `payload` is optional and can be any JSON-serializable value
+
+### Control Actions
+
+#### `schema-error`
+
+Sent by the server when a client message fails validation.
+
+**Example:**
+```json
+{
+  "type": "control",
+  "action": "schema-error"
+}
+```
+
+**Trigger conditions:**
+- Invalid JSON
+- Missing required fields
+- Wrong field types
+- Empty strings where non-empty required
+
+**Client handling:**
+```javascript
+ws.onmessage = (event) => {
+  const msg = JSON.parse(event.data);
+  
+  if (msg.type === 'control' && msg.action === 'schema-error') {
+    console.error('Server rejected last message due to schema error');
+    // Check signaling payload shapes
+  }
+};
+```
+
+#### `peer-disconnected`
+
+Sent to all room members when a peer leaves.
+
+**Example:**
+```json
+{
+  "type": "peer-disconnected"
+}
+```
+
+<Info>
+`peer-disconnected` uses a simplified schema without the `control` action field for backwards compatibility.
+</Info>
+
+**Server behavior:**
+- Broadcast when client disconnects (WebSocket close)
+- Broadcast when client removed from Redis room
+- Published to Redis channel: `room:ROOM_ID`
+- Forwarded to all remaining peers
+
+**Client handling:**
+```javascript
+ws.onmessage = (event) => {
+  const msg = JSON.parse(event.data);
+  
+  if (msg.type === 'peer-disconnected') {
+    console.warn('Peer has disconnected');
+    // Clean up peer connection
+    // Update UI
+    // Optionally attempt reconnection
+  }
+};
+```
+
+**Example implementation:**
+```javascript
+switch (msg.type) {
+  case 'peer-disconnected':
+    log('Peer has disconnected. Closing connection.', 'warn');
+    updateConnectionStatus('disconnected', 'Peer Left');
+    
+    if (ws) {
+      ws.onclose = null; // Prevent auto-reconnect
+      ws.close();
+    }
+    
+    if (peerConnection) {
+      peerConnection.close();
+      peerConnection = null;
+    }
+    break;
+}
+```
+
+## Message Flow Examples
+
+### Complete Connection Establishment
+
+```
+1. Client connects to WebSocket
+   → ws://server?roomId=game-123
+   
+2. Host creates offer
+   Host → Server: {
+     "type": "offer",
+     "sdp": "v=0\r\no=..." 
+   }
+   
+3. Server forwards to client
+   Server → Client: {
+     "type": "offer",
+     "sdp": "v=0\r\no=..."
+   }
+   
+4. Client creates answer
+   Client → Server: {
+     "type": "answer",
+     "sdp": "v=0\r\no=..."
+   }
+   
+5. Server forwards to host
+   Server → Host: {
+     "type": "answer",
+     "sdp": "v=0\r\no=..."
+   }
+   
+6. ICE candidates exchanged
+   Host → Server: {
+     "type": "candidate",
+     "candidate": "candidate:1 1 udp ...",
+     "sdpMid": "0",
+     "sdpMLineIndex": 0
+   }
+   
+   Server → Client: (same message)
+   
+   Client → Server: {
+     "type": "candidate",
+     "candidate": "candidate:1 1 udp ...",
+     "sdpMid": "0",
+     "sdpMLineIndex": 0
+   }
+   
+   Server → Host: (same message)
+   
+7. WebRTC connection established
+   → Data channels open
+   → Media streaming begins
+```
+
+### Disconnection Flow
+
+```
+1. Client disconnects (network issue, browser close, etc.)
+   Client WebSocket → closes
+   
+2. Server detects disconnection
+   → Clears heartbeat interval
+   → Removes from localRooms map
+   → SREM room:game-123 client:uuid
+   
+3. Server notifies remaining peers
+   Server → All Peers: {
+     "type": "peer-disconnected"
+   }
+   
+4. Peers clean up connection
+   → Close RTCPeerConnection
+   → Update UI
+   → Stop rendering loop
+```
+
+## Error Scenarios
+
+### Invalid Message Type
+
+**Sent:**
+```json
+{
+  "type": "unknown-type",
+  "data": "something"
+}
+```
+
+**Result:**
+- Message validation fails
+- Server logs: `"Dropping invalid signaling message"`
+- Server sends: `{ "type": "control", "action": "schema-error" }`
+- Message not forwarded
+- `signaling_schema_rejects_total` metric incremented
+
+### Missing Required Field
+
+**Sent:**
+```json
+{
+  "type": "offer"
+  // Missing sdp field
+}
+```
+
+**Result:**
+- Schema validation fails on missing `sdp`
+- Server logs: `"Dropping invalid signaling message"`
+- Server sends: `{ "type": "control", "action": "schema-error" }`
+- Message not forwarded
+
+### Empty SDP String
+
+**Sent:**
+```json
+{
+  "type": "answer",
+  "sdp": ""
+}
+```
+
+**Result:**
+- Schema validation fails (minimum length: 1)
+- Server logs: `"Dropping invalid signaling message"`
+- Server sends: `{ "type": "control", "action": "schema-error" }`
+- Message not forwarded
+
+### Malformed JSON
+
+**Sent:**
+```
+{type: "offer", sdp: "..."}
+```
+
+**Result:**
+- JSON parse fails
+- Server logs: `"Dropping non-JSON client message"`
+- No control message sent (can't send to unparseable client)
+- Message not forwarded
+
+## Message Size Limits
+
+**Maximum message size**: `messageMaxBytes` (default: 64KB)
+
+**Oversized message behavior:**
+```javascript
+if (Buffer.byteLength(message) > config.messageMaxBytes) {
+  // Message dropped silently
+  log('Dropping oversized text message', { clientId, roomId });
+  return;
+}
+```
+
+**Typical message sizes:**
+- ICE candidate: 100-300 bytes
+- SDP offer: 2-10 KB
+- SDP answer: 2-10 KB
+- Control message: 50-100 bytes
+
+<Tip>
+For very large SDP descriptions (multiple codecs, many media lines), consider stripping unnecessary attributes or using SDP compression.
+</Tip>
+
+## Rate Limiting Impact
+
+Messages are subject to multiple rate limits:
+
+1. **Per-client token bucket**: 100 msg/10s (default)
+2. **Per-IP rate limit**: 500 msg/10s (default)
+3. **Per-room rate limit**: 1000 msg/10s (default)
+
+When rate limited:
+- Message dropped silently
+- Server logs: `"Rate limit exceeded, dropping message"`
+- `signaling_rate_limit_drops_total` metric incremented
+- No error message sent to client
+
+**Best practice**: Implement client-side rate limiting and exponential backoff.
+
+## Schema Validation Implementation
+
+The server uses Zod for runtime type validation:
+
+```javascript
+const { validateSignalingMessage } = require('./validation');
+
+const validation = validateSignalingMessage(parsedMessage);
+
+if (!validation.ok) {
+  log('Dropping invalid signaling message', { clientId, roomId });
+  
+  // Send error feedback
+  ws.send(JSON.stringify({ 
+    type: 'control', 
+    action: 'schema-error' 
+  }));
+  
+  incSchemaRejects();
+  return;
+}
+
+// Forward validated message
+const validatedData = validation.data;
+```
+
+## TypeScript Definitions
+
+For TypeScript clients, use these type definitions:
+
+```typescript
+type SignalingMessage = 
+  | OfferMessage 
+  | AnswerMessage 
+  | CandidateMessage 
+  | ControlMessage;
+
+interface OfferMessage {
+  type: 'offer';
+  sdp: string;
+}
+
+interface AnswerMessage {
+  type: 'answer';
+  sdp: string;
+}
+
+interface CandidateMessage {
+  type: 'candidate';
+  candidate: string;
+  sdpMid?: string;
+  sdpMLineIndex?: number;
+}
+
+interface ControlMessage {
+  type: 'control';
+  action: string;
+  payload?: unknown;
+}
+
+interface PeerDisconnectedMessage {
+  type: 'peer-disconnected';
+}
+
+type IncomingMessage = SignalingMessage | PeerDisconnectedMessage;
+```
+
+## Testing Messages
+
+Test message validation using the WebSocket connection:
+
+```javascript
+const ws = new WebSocket('ws://localhost:3002?roomId=test');
+
+ws.onopen = () => {
+  // Valid offer
+  ws.send(JSON.stringify({
+    type: 'offer',
+    sdp: 'v=0\r\no=- 123 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n'
+  }));
+  
+  // Invalid (missing sdp)
+  ws.send(JSON.stringify({
+    type: 'offer'
+  }));
+  // Expect: { type: 'control', action: 'schema-error' }
+  
+  // Invalid (empty candidate)
+  ws.send(JSON.stringify({
+    type: 'candidate',
+    candidate: '',
+    sdpMid: '0'
+  }));
+  // Expect: { type: 'control', action: 'schema-error' }
+};
+
+ws.onmessage = (event) => {
+  console.log('Received:', JSON.parse(event.data));
+};
+```

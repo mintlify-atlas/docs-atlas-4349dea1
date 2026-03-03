@@ -1,0 +1,569 @@
+---
+title: 'Matchmaker Service'
+description: 'Redis-based matchmaking service for automatic host discovery and assignment'
+---
+
+# Matchmaker Service
+
+The CloudGaming matchmaker is a Node.js REST API that tracks available hosts and connects clients to game sessions automatically.
+
+## Architecture Overview
+
+The matchmaker provides:
+
+- **Host Heartbeats**: Redis-backed host registration with TTL expiration
+- **Match Finding**: Weighted selection algorithm with region preferences
+- **Dynamic ICE**: Per-match TURN credential provisioning via Metered API
+- **Health Checks**: Railway-compatible liveness/readiness probes
+- **Transaction Safety**: Redis WATCH/MULTI for race-free slot allocation
+
+## REST API
+
+<Tabs>
+  <Tab title="Host Registration">
+    ## Host Heartbeat Endpoint
+
+    Hosts send periodic heartbeats to register availability:
+
+    ### POST `/api/host/heartbeat`
+
+    **Authentication**: Bearer token (host secret)
+
+    **Request Body**:
+    ```json
+    {
+      "hostId": "host-uuid-123",
+      "roomId": "GAME-ABC-123",
+      "region": "us-east",
+      "status": "idle",
+      "capacity": 4,
+      "availableSlots": 3
+    }
+    ```
+
+    **Response**:
+    ```json
+    {
+      "success": true,
+      "ttl": 30
+    }
+    ```
+
+    ### Implementation
+
+    ```javascript
+    // From Server/mm_server/Matchmaker.js:208-255
+    app.post('/api/host/heartbeat', async(req, res) => {
+        const result = HeartbeatSchema.safeParse(req.body);
+        if (!result.success) {
+            return res.status(400).json({
+                success: false,
+                error: 'Validation failed',
+                issues: formatZodIssues(result.error)
+            });
+        }
+        
+        const { hostId, roomId, region, status } = result.data;
+        const capacity = Math.max(1, result.data.capacity || 1);
+        let availableSlots = result.data.availableSlots ?? capacity;
+        availableSlots = Math.max(0, Math.min(capacity, availableSlots));
+        
+        const key = `host:${hostId}`;
+        const value = JSON.stringify({
+            hostId,
+            roomId,
+            region: region || 'local',
+            status: availableSlots > 0 ? (status || 'idle') : 'busy',
+            capacity,
+            availableSlots,
+            lastHeartbeat: Date.now()
+        });
+        
+        // Store in Redis with 30s TTL
+        const isIdle = availableSlots > 0;
+        const multi = redisClient.multi();
+        multi.set(key, value, { EX: 30 });
+        
+        if (isIdle) {
+            multi.sAdd('idle_hosts', hostId);
+        } else {
+            multi.sRem('idle_hosts', hostId);
+        }
+        await multi.exec();
+        
+        res.json({ success: true, ttl: 30 });
+    });
+    ```
+
+    ### Host State Tracking
+
+    **Redis Keys**:
+    - `host:{hostId}`: Host metadata (JSON, 30s TTL)
+    - `idle_hosts`: Set of host IDs with available slots
+
+    **Status Values**:
+    - `idle`: Available for new connections
+    - `busy`: All slots occupied
+    - `allocated`: Reserved by matchmaker
+
+    ### Automatic Cleanup
+
+    ```javascript
+    // From Server/mm_server/Matchmaker.js:189-206
+    async function pruneStaleIdleHosts() {
+        const stale = [];
+        const ids = await redisClient.sMembers('idle_hosts');
+        for (const id of ids) {
+            const ttl = await redisClient.ttl(`host:${id}`);
+            if (ttl === -2) {  // Key doesn't exist
+                stale.push(id);
+            }
+        }
+        if (stale.length > 0) {
+            await redisClient.sRem('idle_hosts', stale);
+            log('info', 'Pruned stale idle hosts', { staleCount: stale.length });
+        }
+    }
+    
+    // Run every 10 seconds
+    setInterval(() => pruneStaleIdleHosts(), 10000);
+    ```
+
+    Removes hosts whose heartbeat TTL expired.
+  </Tab>
+
+  <Tab title="Match Finding">
+    ## Match Finding Endpoint
+
+    Clients request a host assignment:
+
+    ### POST `/api/match/find`
+
+    **Request Body** (optional):
+    ```json
+    {
+      "region": "us-east",
+      "hostId": "specific-host-uuid"  // Optional: target specific host
+    }
+    ```
+
+    **Success Response**:
+    ```json
+    {
+      "found": true,
+      "roomId": "GAME-ABC-123",
+      "signalingUrl": "wss://signaling.example.com",
+      "iceServers": [
+        { "urls": "stun:stun.l.google.com:19302" },
+        {
+          "urls": ["turn:turn.example.com:3478"],
+          "username": "temp-user-123",
+          "credential": "temp-pass-xyz"
+        }
+      ]
+    }
+    ```
+
+    **Failure Response**:
+    ```json
+    {
+      "found": false,
+      "message": "No hosts available"
+    }
+    ```
+
+    ### Weighted Selection Algorithm
+
+    ```javascript
+    // From Server/mm_server/Matchmaker.js:295-421
+    app.post('/api/match/find', async(req, res) => {
+        // 1. Prune stale hosts
+        await pruneStaleIdleHosts();
+        
+        // 2. Sample up to 50 random candidates from idle_hosts set
+        const sampleSize = requestedHostId ? 1 : 50;
+        const candidateIds = requestedHostId
+            ? [requestedHostId]
+            : await redisClient.sRandMember('idle_hosts', sampleSize);
+        
+        // 3. Build weighted candidate list
+        const candidates = [];
+        for (const hostId of candidateIds) {
+            const json = await redisClient.get(`host:${hostId}`);
+            if (!json) continue;
+            
+            const host = JSON.parse(json);
+            const availableSlots = Math.max(0, host.availableSlots || 0);
+            if (availableSlots <= 0) continue;
+            
+            // Weight by region match
+            const regionsMatch = !region || host.region === region;
+            const weight = regionsMatch ? 5 : 1;
+            candidates.push({ hostId, host, weight });
+        }
+        
+        // 4. Prefer region-matched hosts
+        const regionPreferred = region ? candidates.filter(c => c.host.region === region) : candidates;
+        const selectionPool = (region && regionPreferred.length > 0) ? regionPreferred : candidates;
+        
+        // 5. Weighted random selection with Redis transaction
+        const pool = [...selectionPool];
+        while (pool.length > 0) {
+            const pick = weightedPick(pool);
+            if (!pick) break;
+            
+            const key = `host:${pick.hostId}`;
+            
+            // Start Redis transaction
+            await redisClient.watch(key);
+            const json = await redisClient.get(key);
+            if (!json) {
+                await redisClient.unwatch();
+                pool.splice(pool.indexOf(pick), 1);
+                continue;
+            }
+            
+            const host = JSON.parse(json);
+            const availableSlots = Math.max(0, host.availableSlots || 0);
+            
+            if (availableSlots > 0) {
+                // Decrement available slots atomically
+                const remainingSlots = Math.max(0, availableSlots - 1);
+                host.availableSlots = remainingSlots;
+                host.status = remainingSlots > 0 ? 'idle' : 'busy';
+                
+                const multi = redisClient.multi()
+                    .set(key, JSON.stringify(host), { EX: 30 });
+                
+                if (remainingSlots > 0) {
+                    multi.sAdd('idle_hosts', pick.hostId);
+                } else {
+                    multi.sRem('idle_hosts', pick.hostId);
+                }
+                
+                const results = await multi.exec();
+                
+                if (results) {
+                    // Transaction succeeded - return match
+                    const iceServers = await getIceServers();
+                    return res.json({
+                        found: true,
+                        roomId: host.roomId,
+                        signalingUrl: config.signalingPublicUrl,
+                        iceServers
+                    });
+                } else {
+                    // Race detected - retry with next host
+                    continue;
+                }
+            }
+            
+            await redisClient.unwatch();
+            pool.splice(pool.indexOf(pick), 1);
+        }
+        
+        return res.status(404).json({ 
+            found: false, 
+            message: 'No available hosts found matching criteria' 
+        });
+    });
+    ```
+
+    ### Weighted Random Selection
+
+    ```javascript
+    // From Server/mm_server/Matchmaker.js:178-187
+    function weightedPick(items) {
+        const total = items.reduce((sum, item) => sum + (item.weight || 1), 0);
+        if (total <= 0) return null;
+        
+        let r = Math.random() * total;
+        for (const item of items) {
+            r -= (item.weight || 1);
+            if (r <= 0) return item;
+        }
+        return null;
+    }
+    ```
+
+    **Weight Calculation**:
+    - Same region: 5x weight
+    - Different region: 1x weight
+    - More available slots: Higher selection probability
+
+    ### Race Condition Prevention
+
+    Uses Redis `WATCH`/`MULTI` for optimistic locking:
+
+    1. `WATCH` the host key
+    2. Read current slot count
+    3. Decrement slots
+    4. `MULTI` transaction to update
+    5. If another client modified the key, transaction fails
+    6. Retry with next candidate
+  </Tab>
+
+  <Tab title="Dynamic ICE">
+    ## Metered TURN Integration
+
+    The matchmaker provisions short-lived TURN credentials per match:
+
+    ### Metered API Flow
+
+    ```javascript
+    // From Server/mm_server/Matchmaker.js:12-52
+    async function getIceServers() {
+        const { domain, apiKey, expirySeconds } = config.metered;
+        const fallback = [{ urls: 'stun:stun.l.google.com:19302' }];
+        
+        if (!domain || !apiKey) {
+            return fallback;
+        }
+        
+        try {
+            // Step 1: Create expiring credential
+            const createRes = await fetchJson(
+                `https://${domain}.metered.live/api/v1/turn/credential?secretKey=${apiKey}`,
+                'POST',
+                { expiryInSeconds: expirySeconds }
+            );
+            
+            if (!createRes || !createRes.apiKey) {
+                log('warn', 'Metered credential creation returned no apiKey');
+                return fallback;
+            }
+            
+            // Step 2: Fetch full ICE server array
+            const iceServers = await fetchJson(
+                `https://${domain}.metered.live/api/v1/turn/credentials?apiKey=${createRes.apiKey}`,
+                'GET'
+            );
+            
+            if (!Array.isArray(iceServers) || iceServers.length === 0) {
+                log('warn', 'Metered returned empty iceServers');
+                return fallback;
+            }
+            
+            // Always include STUN alongside TURN
+            return [{ urls: 'stun:stun.l.google.com:19302' }, ...iceServers];
+        } catch (err) {
+            log('error', 'Failed to fetch Metered TURN credentials', { error: String(err) });
+            return fallback;
+        }
+    }
+    ```
+
+    ### Configuration
+
+    ```bash
+    # Metered TURN Service
+    METERED_DOMAIN=your-domain
+    METERED_API_KEY=your-api-key
+    METERED_EXPIRY_SECONDS=3600  # Credential lifetime
+    ```
+
+    ### Benefits
+
+    - **No Persistent Credentials**: Each match gets unique credentials
+    - **Automatic Expiration**: Credentials expire after session ends
+    - **Reduced Attack Surface**: No long-lived secrets to leak
+    - **Cost Control**: Only pay for active sessions
+
+    ### Fallback Strategy
+
+    If Metered API fails, falls back to Google STUN:
+
+    ```json
+    [
+      { "urls": "stun:stun.l.google.com:19302" }
+    ]
+    ```
+
+    This allows signaling to proceed even without TURN, relying on direct connectivity.
+  </Tab>
+
+  <Tab title="Admin Endpoints">
+    ## Administrative Endpoints
+
+    ### List All Hosts
+
+    **GET** `/api/hosts`
+
+    Returns all registered hosts:
+
+    ```json
+    [
+      {
+        "hostId": "host-uuid-123",
+        "roomId": "GAME-ABC-123",
+        "region": "us-east",
+        "status": "idle",
+        "capacity": 4,
+        "availableSlots": 3,
+        "lastHeartbeat": 1678901234567
+      }
+    ]
+    ```
+
+    ### Host TTL Status
+
+    **GET** `/api/hosts/ttl`
+
+    Returns TTL for each host:
+
+    ```json
+    [
+      {
+        "hostId": "host-uuid-123",
+        "ttlSeconds": 28
+      },
+      {
+        "hostId": "host-uuid-456",
+        "ttlSeconds": 15
+      }
+    ]
+    ```
+
+    Useful for monitoring host health and detecting imminent expirations.
+
+    ### Implementation
+
+    ```javascript
+    // From Server/mm_server/Matchmaker.js:257-293
+    app.get('/api/hosts', async (req, res) => {
+        const hostIds = await redisClient.sMembers('idle_hosts');
+        if (hostIds.length === 0) {
+            return res.json([]);
+        }
+        
+        const hostKeys = hostIds.map(id => `host:${id}`);
+        const hostsJSON = await redisClient.mGet(hostKeys);
+        const hosts = hostsJSON
+            .filter(json => json !== null)
+            .map(json => JSON.parse(json));
+        
+        res.json(hosts);
+    });
+    
+    app.get('/api/hosts/ttl', async (req, res) => {
+        await pruneStaleIdleHosts();
+        const hostIds = await redisClient.sMembers('idle_hosts');
+        const ttlEntries = [];
+        
+        for (const id of hostIds) {
+            const ttl = await redisClient.ttl(`host:${id}`);
+            if (ttl === -2) {  // Key doesn't exist
+                await redisClient.sRem('idle_hosts', id);
+                continue;
+            }
+            ttlEntries.push({ hostId: id, ttlSeconds: ttl });
+        }
+        
+        res.json(ttlEntries);
+    });
+    ```
+  </Tab>
+</Tabs>
+
+## Configuration
+
+### Environment Variables
+
+```bash
+# Server
+PORT=3000                                 # HTTP server port
+
+# Redis
+REDIS_URL=redis://localhost:6379         # Redis connection URL
+
+# Authentication
+HOST_SECRET=your-host-secret             # Bearer token for hosts
+HOST_SECRET_PREVIOUS=old-secret          # For secret rotation
+
+# Signaling
+SIGNALING_PUBLIC_URL=wss://signaling.example.com  # Returned to clients
+
+# Metered TURN
+METERED_DOMAIN=your-domain               # Metered account domain
+METERED_API_KEY=your-api-key             # Metered API key
+METERED_EXPIRY_SECONDS=3600              # TURN credential lifetime
+```
+
+### Schema Validation
+
+```javascript
+// From Server/mm_server/Matchmaker.js:164-176
+const HeartbeatSchema = z.object({
+    hostId: z.string().uuid().or(z.string().min(1)),
+    roomId: z.string().min(1),
+    region: z.string().optional(),
+    status: z.enum(['idle', 'busy', 'allocated']).optional(),
+    capacity: z.number().int().positive().optional(),
+    availableSlots: z.number().int().nonnegative().optional()
+});
+
+const MatchFindSchema = z.object({
+    region: z.string().optional(),
+    hostId: z.string().optional()
+});
+```
+
+Ensures type safety and validation at runtime.
+
+## Client Integration
+
+### JavaScript Example
+
+```javascript
+// From Client/html-server/index.html:602-665
+document.getElementById('findMatchButton').addEventListener('click', async () => {
+    const matchStatus = document.getElementById('matchStatus');
+    matchStatus.textContent = 'Looking for available hosts...';
+    
+    try {
+        const response = await fetch(`${matchmakerUrl}/api/match/find`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({}),
+            mode: 'cors'
+        });
+        
+        const data = await response.json();
+        
+        if (data.found) {
+            matchStatus.textContent = `Found host! Connecting to room ${data.roomId}...`;
+            
+            // Use returned ICE servers
+            currentIceServers = data.iceServers;
+            
+            // Connect to signaling server
+            connectToSignalingServer(data.roomId, data.signalingUrl);
+        } else {
+            matchStatus.textContent = data.message || 'No hosts available. Try again later.';
+        }
+    } catch (error) {
+        console.error('Matchmaker error:', error);
+        matchStatus.textContent = `Connection failed: ${error.message}`;
+    }
+});
+```
+
+## Key Source Files
+
+<CardGroup cols={2}>
+  <Card title="Matchmaker.js" icon="network-wired" href="https://github.com/yourusername/cloudgaming/blob/main/Server/mm_server/Matchmaker.js">
+    Main matchmaker implementation with host tracking and match finding logic.
+  </Card>
+  
+  <Card title="config.js" icon="gear" href="https://github.com/yourusername/cloudgaming/blob/main/Server/mm_server/config.js">
+    Configuration loader for environment variables and defaults.
+  </Card>
+</CardGroup>
+
+<Note>
+  **Best Practices:**
+  - Send heartbeats every 10-15 seconds (TTL is 30s)
+  - Use region-based matching for lower latency
+  - Monitor `/api/hosts/ttl` to detect failing hosts
+  - Rotate `HOST_SECRET` periodically using `HOST_SECRET_PREVIOUS`
+</Note>

@@ -1,0 +1,202 @@
+---
+title: Client Endpoints
+description: API endpoints for client matchmaking and host discovery
+---
+
+These endpoints are used by Web and Electron clients to discover and connect to available gaming hosts.
+
+## Find Match
+
+<Tip>
+Call this endpoint when the user clicks "Play" or initiates a gaming session.
+</Tip>
+
+Finds an available host for matchmaking. The service scans all registered hosts, filters by region (if specified), and returns connection details for an idle host.
+
+```bash
+POST /api/match/find
+```
+
+### Request Body
+
+<ParamField body="region" type="string" optional>
+  Geographic region filter for matchmaking. If provided, only hosts in the specified region will be considered.
+  
+  Supported values: `us-east-1`, `us-west-1`, `eu-central`, `local`
+  
+  If omitted, any available host from any region may be returned.
+</ParamField>
+
+### Request Example
+
+**With region filter:**
+
+```bash
+curl -X POST https://api.yourdomain.com/api/match/find \
+  -H "Content-Type: application/json" \
+  -d '{
+    "region": "us-east-1"
+  }'
+```
+
+**Without region filter:**
+
+```bash
+curl -X POST https://api.yourdomain.com/api/match/find \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
+### Success Response (200 OK)
+
+Returned when an available host is found.
+
+<ResponseField name="found" type="boolean">
+  Always `true` in a 200 response. Indicates a host was successfully matched.
+</ResponseField>
+
+<ResponseField name="roomId" type="string">
+  The room identifier for WebRTC signaling. Use this to join the signaling channel and establish a peer connection with the host.
+</ResponseField>
+
+<ResponseField name="signalingUrl" type="string">
+  WebSocket URL for the signaling server. Connect to this URL to exchange WebRTC offer/answer/ICE candidates.
+  
+  Format: `ws://` for development, `wss://` for production
+</ResponseField>
+
+<ResponseField name="iceServers" type="array">
+  Array of ICE (Interactive Connectivity Establishment) server configurations for WebRTC.
+  
+  Each server object contains:
+  - `urls` - STUN/TURN server URL
+  - `username` - Temporary username for TURN authentication
+  - `credential` - Temporary password generated using shared secret with Coturn
+</ResponseField>
+
+### Success Response Example
+
+```json
+{
+  "found": true,
+  "roomId": "room-abc123xyz",
+  "signalingUrl": "wss://play.yourdomain.com",
+  "iceServers": [
+    {
+      "urls": "turn:turn.yourdomain.com:3478",
+      "username": "1715620000:user",
+      "credential": "generated-password-hash"
+    }
+  ]
+}
+```
+
+### Not Found Response (404)
+
+Returned when no available hosts match the criteria.
+
+<ResponseField name="found" type="boolean">
+  Always `false` in a 404 response. Indicates no hosts are currently available.
+</ResponseField>
+
+<ResponseField name="message" type="string">
+  Human-readable explanation of why no host was found.
+</ResponseField>
+
+### Not Found Response Example
+
+```json
+{
+  "found": false,
+  "message": "No available hosts in this region."
+}
+```
+
+### Possible 404 Scenarios
+
+- No hosts are currently registered (no active heartbeats)
+- All registered hosts have `status: "busy"`
+- No hosts match the specified region filter
+- All hosts in the region are busy
+
+### WebRTC Connection Flow
+
+Once you receive a successful match response:
+
+1. **Connect to signaling server**:
+   ```javascript
+   const ws = new WebSocket(response.signalingUrl);
+   ```
+
+2. **Join the room**:
+   ```javascript
+   ws.send(JSON.stringify({
+     type: 'join',
+     roomId: response.roomId
+   }));
+   ```
+
+3. **Create peer connection with ICE servers**:
+   ```javascript
+   const pc = new RTCPeerConnection({
+     iceServers: response.iceServers
+   });
+   ```
+
+4. **Exchange WebRTC signaling messages** through the WebSocket connection
+
+### ICE Server Credentials
+
+<Info>
+The TURN credentials are temporary and generated using a shared secret with Coturn. They expire after a configured time period.
+</Info>
+
+The `username` format is `timestamp:user`, where:
+- `timestamp` - Unix timestamp when the credential was generated
+- `user` - Generic user identifier
+
+The `credential` is a password hash computed from the timestamp and shared secret.
+
+### Regional Matchmaking
+
+For optimal latency, specify a region close to the client:
+
+```javascript
+// Detect user's region (example)
+const userRegion = detectUserRegion(); // e.g., "us-east-1"
+
+const response = await fetch('/api/match/find', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ region: userRegion })
+});
+```
+
+### Error Handling
+
+<Warning>
+Always handle the 404 case gracefully. Display a friendly message asking the user to try again later.
+</Warning>
+
+```javascript
+const response = await fetch('/api/match/find', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ region: 'us-east-1' })
+});
+
+if (response.status === 404) {
+  const data = await response.json();
+  showError('No gaming PCs available. Please try again in a moment.');
+  console.log(data.message);
+} else if (response.ok) {
+  const match = await response.json();
+  connectToHost(match);
+}
+```
+
+### Rate Limiting
+
+<Note>
+There are currently no rate limits enforced. However, avoid polling this endpoint repeatedly. Implement exponential backoff if retrying after a 404.
+</Note>

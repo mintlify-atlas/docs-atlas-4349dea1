@@ -1,0 +1,590 @@
+---
+title: Client Deployment
+description: Deploy the browser-based cloud gaming client with static hosting
+---
+
+## Overview
+
+The CloudGaming client is a single-page HTML5 application that:
+
+- Requests a host assignment from the matchmaker
+- Establishes WebRTC connection via the signaling server
+- Receives video/audio streams from the Windows host
+- Sends keyboard, mouse, and gamepad input back to the host
+- Provides on-screen controls and connection status
+
+**Technology**: Pure HTML5, vanilla JavaScript, WebRTC API - no build step required.
+
+## File Structure
+
+The client consists of a single HTML file with embedded CSS and JavaScript:
+
+```
+Client/html-server/
+├── index.html          # Main client application (all-in-one)
+└── vercel.json        # Optional: Vercel deployment config
+```
+
+## Configuration
+
+### Updating Service URLs
+
+The client reads configuration from a `<script>` block in `index.html`. Update these values before deployment:
+
+<Steps>
+
+<Step title="Open index.html">
+```bash
+cd Client/html-server
+# Edit with your preferred editor
+```
+</Step>
+
+<Step title="Locate the config object">
+Search for the configuration near the top of the `<script>` section:
+
+```javascript
+const config = {
+  matchmakerUrl: 'http://localhost:3000',
+  signalingUrl: 'ws://localhost:3002',
+  region: 'us-east',  // Optional: preferred region
+};
+```
+</Step>
+
+<Step title="Update URLs for production">
+```javascript
+const config = {
+  matchmakerUrl: 'https://matchmaker.yourdomain.com',
+  signalingUrl: 'wss://signaling.yourdomain.com',
+  region: 'us-east',
+};
+```
+
+<Note>
+The `signalingUrl` is typically returned by the matchmaker, so it's used as a fallback. The matchmaker response takes precedence.
+</Note>
+</Step>
+
+</Steps>
+
+### CORS Configuration
+
+Ensure your backend services allow requests from your client domain:
+
+**Signaling Server** (`Server/.env`):
+```bash
+ALLOWED_ORIGINS=https://game.yourdomain.com,https://www.yourdomain.com
+REQUIRE_WSS=true
+```
+
+**Matchmaker** (`Server/mm_server/Matchmaker.js`):
+```javascript
+// CORS headers are hard-coded to allow all origins by default
+// For production, restrict in a reverse proxy or modify the code:
+res.setHeader('Access-Control-Allow-Origin', 'https://game.yourdomain.com');
+```
+
+## Local Development
+
+For local testing:
+
+<CodeGroup>
+
+```bash Using http-server (npm)
+cd Client/html-server
+npx http-server . -p 8080
+
+# Open http://localhost:8080
+```
+
+```bash Using Python
+cd Client/html-server
+python3 -m http.server 8080
+
+# Open http://localhost:8080
+```
+
+```bash Using PHP
+cd Client/html-server
+php -S localhost:8080
+
+# Open http://localhost:8080
+```
+
+</CodeGroup>
+
+<Warning>
+For WebRTC to work properly:
+- Use `localhost` for local development (secure context)
+- Use HTTPS in production (required for `getUserMedia`, clipboard, etc.)
+</Warning>
+
+## Production Deployment
+
+The client is a static site and can be deployed to any hosting platform.
+
+### Vercel
+
+<Steps>
+
+<Step title="Install Vercel CLI">
+```bash
+npm install -g vercel
+```
+</Step>
+
+<Step title="Deploy">
+```bash
+cd Client/html-server
+vercel --prod
+```
+
+Vercel will:
+- Upload the static files
+- Configure HTTPS automatically
+- Provide a production URL (e.g., `https://cloudgaming.vercel.app`)
+</Step>
+
+<Step title="Configure custom domain (optional)">
+In Vercel dashboard:
+```
+Project Settings → Domains → Add Domain
+→ game.yourdomain.com
+```
+
+Add DNS records as instructed by Vercel.
+</Step>
+
+</Steps>
+
+The included `vercel.json` configures headers and routing:
+
+```json
+{
+  "cleanUrls": true,
+  "trailingSlash": false
+}
+```
+
+### Cloudflare Pages
+
+<Steps>
+
+<Step title="Push to Git repository">
+```bash
+git add Client/html-server/
+git commit -m "Add CloudGaming client"
+git push origin main
+```
+</Step>
+
+<Step title="Create Cloudflare Pages project">
+1. Go to Cloudflare Dashboard → Pages
+2. Connect to Git → Select repository
+3. Configure build:
+   - **Framework preset**: None
+   - **Build command**: (leave empty)
+   - **Build output directory**: `Client/html-server`
+</Step>
+
+<Step title="Deploy">
+Cloudflare will automatically:
+- Build and deploy on every push
+- Provide HTTPS
+- Distribute globally via CDN
+- Provide a URL: `https://cloudgaming.pages.dev`
+</Step>
+
+</Steps>
+
+### Netlify
+
+<Steps>
+
+<Step title="Install Netlify CLI">
+```bash
+npm install -g netlify-cli
+```
+</Step>
+
+<Step title="Deploy">
+```bash
+cd Client/html-server
+netlify deploy --prod --dir .
+```
+
+Or use drag-and-drop deployment:
+1. Visit [app.netlify.com/drop](https://app.netlify.com/drop)
+2. Drag the `Client/html-server/` folder
+3. Netlify provides instant HTTPS deployment
+</Step>
+
+</Steps>
+
+### AWS S3 + CloudFront
+
+<Steps>
+
+<Step title="Create S3 bucket">
+```bash
+aws s3 mb s3://cloudgaming-client
+aws s3 website s3://cloudgaming-client --index-document index.html
+```
+</Step>
+
+<Step title="Upload files">
+```bash
+cd Client/html-server
+aws s3 sync . s3://cloudgaming-client --acl public-read
+```
+</Step>
+
+<Step title="Create CloudFront distribution">
+```bash
+aws cloudfront create-distribution \
+  --origin-domain-name cloudgaming-client.s3-website-us-east-1.amazonaws.com \
+  --default-root-object index.html
+```
+
+This provides:
+- HTTPS via AWS Certificate Manager
+- Global CDN distribution
+- Custom domain support
+</Step>
+
+</Steps>
+
+### GitHub Pages
+
+<Steps>
+
+<Step title="Create gh-pages branch">
+```bash
+git checkout -b gh-pages
+
+# Copy client to root
+cp Client/html-server/index.html .
+cp Client/html-server/vercel.json .
+
+git add index.html vercel.json
+git commit -m "Deploy client to GitHub Pages"
+git push origin gh-pages
+```
+</Step>
+
+<Step title="Enable GitHub Pages">
+1. Go to repository → Settings → Pages
+2. Source: Deploy from branch `gh-pages`
+3. Folder: `/ (root)`
+4. Save
+
+Your client will be available at:
+```
+https://<username>.github.io/<repository>/
+```
+</Step>
+
+</Steps>
+
+### Docker / Self-Hosted
+
+For self-hosting with nginx:
+
+<Tabs>
+<Tab title="Docker">
+Create `Dockerfile` in `Client/html-server/`:
+
+```dockerfile
+FROM nginx:alpine
+
+COPY index.html /usr/share/nginx/html/
+COPY vercel.json /usr/share/nginx/html/
+
+EXPOSE 80
+
+CMD ["nginx", "-g", "daemon off;"]
+```
+
+Build and run:
+```bash
+docker build -t cloudgaming-client .
+docker run -d -p 8080:80 cloudgaming-client
+```
+</Tab>
+
+<Tab title="nginx config">
+```nginx
+server {
+    listen 80;
+    server_name game.yourdomain.com;
+
+    root /var/www/cloudgaming;
+    index index.html;
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # Security headers
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "no-referrer-when-downgrade" always;
+}
+```
+
+Deploy:
+```bash
+sudo cp Client/html-server/index.html /var/www/cloudgaming/
+sudo systemctl reload nginx
+```
+</Tab>
+</Tabs>
+
+## WebRTC Configuration
+
+### ICE Servers
+
+The client receives ICE servers (STUN/TURN) from the matchmaker. For testing, you can hardcode fallback servers:
+
+```javascript
+const iceServers = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+];
+
+const peerConnection = new RTCPeerConnection({ iceServers });
+```
+
+For production, ensure the matchmaker is configured with TURN servers (see [Matchmaker Deployment](/deployment/matchmaker)).
+
+### Firewall and NAT
+
+For WebRTC to work:
+
+- **STUN**: UDP ports 3478, 19302 (usually not blocked)
+- **TURN**: TCP/UDP ports 3478, 443 (may require configuration)
+- **RTC**: UDP ports 49152-65535 (ephemeral range, often blocked by corporate firewalls)
+
+<Warning>
+If clients are behind restrictive NATs or firewalls, TURN servers are **required** for connectivity.
+</Warning>
+
+## Client Features
+
+### Controls
+
+The client includes on-screen controls:
+
+- **Fullscreen toggle**: Expands video to fullscreen
+- **Settings**: Adjust quality, latency, input settings
+- **Disconnect**: Close the streaming session
+- **Stats overlay**: Display connection statistics (FPS, latency, bitrate)
+
+### Keyboard and Mouse Capture
+
+Input capture activates when the user clicks on the video stream:
+
+```javascript
+// Pointer lock for mouse capture
+canvas.addEventListener('click', async () => {
+  await canvas.requestPointerLock();
+});
+
+// Keyboard event capture
+document.addEventListener('keydown', (event) => {
+  event.preventDefault();
+  sendInputToHost('keydown', event.keyCode);
+});
+```
+
+### Gamepad Support
+
+The client automatically detects and forwards gamepad input:
+
+```javascript
+window.addEventListener('gamepadconnected', (e) => {
+  console.log('Gamepad connected:', e.gamepad.id);
+});
+
+function pollGamepads() {
+  const gamepads = navigator.getGamepads();
+  for (const gp of gamepads) {
+    if (gp) {
+      sendGamepadState(gp.buttons, gp.axes);
+    }
+  }
+  requestAnimationFrame(pollGamepads);
+}
+```
+
+### Mobile/Touch Support
+
+The client includes basic touch controls:
+
+- **Touch drag**: Mouse movement
+- **Single tap**: Left click
+- **Long press**: Right click
+- **Pinch zoom**: Disabled (to prevent accidental zoom)
+
+<Note>
+For production mobile deployment, consider implementing an on-screen virtual gamepad or custom touch controls.
+</Note>
+
+## Troubleshooting
+
+<AccordionGroup>
+
+<Accordion title="Error: No hosts available">
+**Symptoms**: Matchmaker returns 404 or `{"found": false}`
+
+**Solutions**:
+- Verify at least one Windows host is running and sending heartbeats
+- Check matchmaker `/api/hosts` endpoint: `curl https://matchmaker.yourdomain.com/api/hosts`
+- Ensure host and matchmaker are using the same `HOST_SECRET`
+- Check region matching (client requests `us-east` but hosts are `eu-west`)
+</Accordion>
+
+<Accordion title="Error: WebSocket connection failed">
+**Symptoms**: Cannot connect to signaling server
+
+**Solutions**:
+- Verify signaling server is running: `curl https://signaling.yourdomain.com/healthz`
+- Check browser console for WebSocket errors
+- Ensure `signalingUrl` uses `wss://` (secure WebSocket) for HTTPS sites
+- Check CORS and `ALLOWED_ORIGINS` in signaling server config
+- Verify firewall/load balancer allows WebSocket upgrades
+</Accordion>
+
+<Accordion title="Video not displaying">
+**Symptoms**: Connection established but black screen
+
+**Solutions**:
+- Check browser console for WebRTC errors
+- Verify host is capturing and encoding video (check host logs)
+- Test with `chrome://webrtc-internals` (Chrome) or `about:webrtc` (Firefox)
+- Ensure video codec is supported (H.264 is universally supported)
+- Check if `<video>` element has `autoplay` and `playsinline` attributes
+</Accordion>
+
+<Accordion title="High latency or stuttering">
+**Symptoms**: Visible input delay or choppy video
+
+**Solutions**:
+- Check network latency: Use browser DevTools Network tab
+- Verify host encoding settings (lower `preset`, `cbr` rate control)
+- Enable hardware acceleration in browser settings
+- Reduce video bitrate or resolution on host
+- Check CPU/GPU usage on both client and host
+- Test with `chrome://webrtc-internals` to see packet loss and jitter
+</Accordion>
+
+<Accordion title="Input not working">
+**Symptoms**: Keyboard/mouse input not reaching the host
+
+**Solutions**:
+- Click on the video to activate pointer lock
+- Check browser console for input capture errors
+- Verify host input injection is enabled (`injectionPolicy: "REQUIRE_FOREGROUND"`)
+- Ensure target game window is in foreground on host
+- Test with simple applications (Notepad) before games
+- Check if DataChannels are established in `chrome://webrtc-internals`
+</Accordion>
+
+<Accordion title="CORS errors in console">
+**Symptoms**: `Access-Control-Allow-Origin` errors
+
+**Solutions**:
+- Add client domain to signaling server `ALLOWED_ORIGINS`
+- Enable CORS in matchmaker (currently allows all origins by default)
+- Use a reverse proxy (nginx, Cloudflare) to add CORS headers
+- For development, use `http://localhost` (not `127.0.0.1` or `file://`)
+</Accordion>
+
+<Accordion title="WebRTC connection fails (ICE failed)">
+**Symptoms**: `iceConnectionState` remains `checking` or goes to `failed`
+
+**Diagnosis**:
+```javascript
+peerConnection.oniceconnectionstatechange = () => {
+  console.log('ICE state:', peerConnection.iceConnectionState);
+};
+```
+
+**Solutions**:
+- Check if TURN servers are configured in matchmaker
+- Test TURN connectivity: [Trickle ICE](https://webrtc.github.io/samples/src/content/peerconnection/trickle-ice/)
+- Verify firewall allows UDP on ephemeral ports (49152-65535)
+- For corporate networks, use TURN over TCP port 443
+- Check browser console for ICE candidate gathering errors
+</Accordion>
+
+</AccordionGroup>
+
+## Performance Optimization
+
+### Client-Side
+
+- **Hardware acceleration**: Ensure it's enabled in browser settings
+- **Browser choice**: Chrome/Edge have best WebRTC performance
+- **Close other tabs**: Reduce CPU/memory pressure
+- **Wired connection**: WiFi adds latency and packet loss
+- **Disable browser extensions**: Ad blockers can interfere with WebRTC
+
+### CDN and Caching
+
+For global deployments:
+
+```html
+<!-- Cache the HTML file for 1 hour -->
+<meta http-equiv="Cache-Control" content="max-age=3600">
+
+<!-- Use CDN for assets if you add any -->
+<link rel="stylesheet" href="https://cdn.yourdomain.com/styles.css">
+```
+
+For Cloudflare:
+```
+Cloudflare Dashboard → Caching → Configuration
+→ Browser Cache TTL: 1 hour
+→ Edge Cache TTL: 4 hours
+```
+
+## Security Best Practices
+
+<Warning>
+Production security checklist:
+
+- Always serve client over HTTPS
+- Implement authentication before allowing connections
+- Rate limit matchmaker API requests
+- Add Content Security Policy (CSP) headers
+- Validate all user input before sending to host
+- Monitor for abuse (rapid connection attempts, etc.)
+- Use environment variables for service URLs (if using a build step)
+- Keep WebRTC implementation up to date
+</Warning>
+
+### Content Security Policy
+
+Add CSP headers to prevent XSS attacks:
+
+```html
+<meta http-equiv="Content-Security-Policy" 
+      content="default-src 'self'; 
+               connect-src 'self' https://*.yourdomain.com wss://*.yourdomain.com; 
+               script-src 'self' 'unsafe-inline'; 
+               style-src 'self' 'unsafe-inline';">
+```
+
+Or configure in web server (nginx example):
+```nginx
+add_header Content-Security-Policy "default-src 'self'; connect-src 'self' https://*.yourdomain.com wss://*.yourdomain.com; script-src 'self' 'unsafe-inline';";
+```
+
+## Next Steps
+
+- [Host Setup](/deployment/host-setup) - Ensure Windows hosts are properly configured
+- [Signaling Server](/deployment/signaling-server) - Verify signaling infrastructure
+- [Matchmaker](/deployment/matchmaker) - Configure host discovery and TURN servers
+- [Deployment Overview](/deployment/overview) - Review complete architecture

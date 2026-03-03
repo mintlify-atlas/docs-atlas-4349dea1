@@ -1,0 +1,540 @@
+---
+title: 'Signaling Server'
+description: 'Node.js signaling server with Redis pub/sub for multi-node scaling'
+---
+
+# Signaling Server
+
+The CloudGaming signaling server is a Node.js application that facilitates WebRTC peer connection establishment between hosts and clients.
+
+## Architecture Overview
+
+The signaling server provides:
+
+- **WebSocket Signaling**: SDP offer/answer exchange and ICE candidate relay
+- **Redis Pub/Sub**: Multi-node horizontal scaling
+- **Room Management**: Isolated signaling channels per game session
+- **Health Checks**: Railway-compatible health/readiness endpoints
+- **Rate Limiting**: Redis-backed rate limiting for abuse prevention
+
+## Implementation
+
+### Server Initialization
+
+```javascript
+// From Server/ScalableSignalingServer.js:478-511
+async function main() {
+    // Connect to Redis for pub/sub and state management
+    await redisClient.connect();
+    await subscriber.connect();
+    log('info', 'Connected to Redis');
+    
+    // Subscribe to room pattern for cross-node message forwarding
+    await subscriber.pSubscribe('room:*', handleRedisMessage);
+    log('info', 'Subscribed to Redis channel pattern', { pattern: 'room:*' });
+    
+    // Start combined HTTP + WebSocket server
+    const listenPort = process.env.PORT || config.wsPort;
+    httpServer.listen(listenPort, () => {
+        log('info', 'Scalable Signaling Server listening', { port: listenPort });
+    });
+}
+```
+
+<Tabs>
+  <Tab title="WebSocket Protocol">
+    ## WebSocket Signaling Protocol
+
+    ### Connection Flow
+
+    1. **Client connects with room ID**:
+       ```javascript
+       ws://signaling-server:3002?roomId=GAME-ABC-123
+       ```
+
+    2. **Server validates and joins room**:
+       ```javascript
+       // From Server/ScalableSignalingServer.js:177-336
+       async function handleNewConnection(ws, request) {
+           const parameters = new url.URL(request.url, `ws://${request.headers.host}`).searchParams;
+           const roomId = parameters.get('roomId');
+           
+           // Validate room ID
+           if (!validateRoomId(roomId)) {
+               ws.close(1008, 'Invalid roomId');
+               return;
+           }
+           
+           // Check rate limits
+           const allowed = await rateLimiter.allow({
+               namespace: 'conn',
+               id: ip,
+               limit: config.rateLimitConnPer10s,
+               periodSeconds: 10
+           });
+           
+           // Atomically join room via Redis
+           const result = await atomicJoin(redisClient, roomKey, clientId, config.roomCapacity);
+           if (result === -1) {
+               ws.close(1000, 'Room is full');
+               return;
+           }
+           
+           // Add to local room map and start heartbeat
+           localRooms.get(roomId).add(ws);
+           startHeartbeat(ws);
+       }
+       ```
+
+    3. **Exchange signaling messages**:
+       ```javascript
+       // Client -> Server
+       {
+         "type": "offer",
+         "sdp": "v=0\r\no=..."
+       }
+       
+       // Server -> Peer
+       {
+         "type": "offer",
+         "sdp": "v=0\r\no=..."
+       }
+       
+       // Peer -> Server
+       {
+         "type": "answer",
+         "sdp": "v=0\r\no=..."
+       }
+       
+       // Server -> Client
+       {
+         "type": "answer",
+         "sdp": "v=0\r\no=..."
+       }
+       ```
+
+    ### Message Types
+
+    <Accordion title="SDP Messages">
+      **Offer**: Initial connection proposal from client
+      ```json
+      {
+        "type": "offer",
+        "sdp": "v=0\r\n..."
+      }
+      ```
+
+      **Answer**: Host response to client offer
+      ```json
+      {
+        "type": "answer",
+        "sdp": "v=0\r\n..."
+      }
+      ```
+    </Accordion>
+
+    <Accordion title="ICE Candidates">
+      **Candidate**: Network connectivity information
+      ```json
+      {
+        "type": "candidate",
+        "candidate": "candidate:1 1 UDP 2130706431 192.168.1.100 54321 typ host",
+        "sdpMid": "0",
+        "sdpMLineIndex": 0
+      }
+      ```
+    </Accordion>
+
+    <Accordion title="Control Messages">
+      **Peer Disconnected**: Notification when peer leaves
+      ```json
+      {
+        "type": "peer-disconnected"
+      }
+      ```
+
+      **Schema Error**: Validation failure notification
+      ```json
+      {
+        "type": "control",
+        "action": "schema-error"
+      }
+      ```
+    </Accordion>
+
+    ### Schema Validation
+
+    ```javascript
+    // From Server/validation.js (referenced in ScalableSignalingServer.js:385-392)
+    const validation = validateSignalingMessage(parsedMessage);
+    if (!validation.ok) {
+        log('warn', 'Dropping invalid signaling message');
+        ws.send(JSON.stringify({ type: 'control', action: 'schema-error' }));
+        incSchemaRejects();
+        return;
+    }
+    ```
+
+    Ensures all messages conform to expected structure before forwarding.
+  </Tab>
+
+  <Tab title="Redis Pub/Sub">
+    ## Redis-Based Multi-Node Scaling
+
+    ### Room-Based Channels
+
+    Each room uses a dedicated Redis channel:
+
+    ```javascript
+    // From Server/ScalableSignalingServer.js:140-176
+    function handleRedisMessage(message, channel) {
+        const roomId = channel.replace(/^room:/, '');
+        
+        // Parse message payload
+        const { senderId, data, originServerId } = JSON.parse(message);
+        
+        // Skip messages from this server (avoid loops)
+        if (originServerId === serverInstanceId) {
+            return;
+        }
+        
+        // Forward to local clients in this room
+        const clientsInRoom = localRooms.get(roomId);
+        clientsInRoom.forEach(client => {
+            if (client.clientId !== senderId && client.readyState === WebSocket.OPEN) {
+                // Check backpressure before sending
+                if (client.bufferedAmount > config.backpressureCloseThresholdBytes) {
+                    log('warn', 'Closing client due to excessive backpressure');
+                    client.close(1013, 'Server overloaded');
+                    return;
+                }
+                client.send(JSON.stringify(data));
+            }
+        });
+    }
+    ```
+
+    ### Message Flow
+
+    1. **Client A sends to Server 1**:
+       ```
+       Client A -> Server 1 (WebSocket)
+       ```
+
+    2. **Server 1 publishes to Redis**:
+       ```javascript
+       await redisClient.publish(roomKey, JSON.stringify({
+           senderId: ws.clientId,
+           data: validation.data,
+           originServerId: serverInstanceId
+       }));
+       ```
+
+    3. **All servers receive via pub/sub**:
+       ```
+       Redis Pub/Sub -> Server 1, Server 2, Server 3, ...
+       ```
+
+    4. **Each server forwards to local clients**:
+       ```
+       Server 2 -> Client B (WebSocket)
+       Server 3 -> Client C (WebSocket)
+       ```
+
+    ### Local Fanout Optimization
+
+    ```javascript
+    // From Server/ScalableSignalingServer.js:413-425
+    // Local fanout for same-instance peers (faster than pub/sub)
+    const peers = localRooms.get(ws.roomId);
+    if (peers && peers.size > 0) {
+        const payload = JSON.stringify(validation.data);
+        peers.forEach((peer) => {
+            if (peer !== ws && peer.readyState === WebSocket.OPEN) {
+                peer.send(payload);
+            }
+        });
+    }
+    ```
+
+    Clients on the same server instance receive messages directly without Redis round-trip.
+
+    ### Atomic Operations
+
+    ```javascript
+    // From Server/redisScripts.js (referenced in ScalableSignalingServer.js:281)
+    const atomicJoin = async (client, roomKey, clientId, maxCapacity) => {
+        // Lua script ensures atomic room size check and add
+        const script = `
+            local size = redis.call('SCARD', KEYS[1])
+            if size >= tonumber(ARGV[2]) then
+                return -1
+            end
+            redis.call('SADD', KEYS[1], ARGV[1])
+            return 1
+        `;
+        
+        return await client.eval(script, {
+            keys: [roomKey],
+            arguments: [clientId, maxCapacity.toString()]
+        });
+    };
+    ```
+
+    Prevents race conditions when multiple clients join simultaneously.
+  </Tab>
+
+  <Tab title="Session Management">
+    ## Room & Session Handling
+
+    ### Room Lifecycle
+
+    ```javascript
+    // From Server/ScalableSignalingServer.js:276-306
+    // Join room atomically
+    const roomKey = `room:${roomId}`;
+    const clientId = safeClientId();
+    const result = await atomicJoin(redisClient, roomKey, clientId, config.roomCapacity);
+    
+    if (result === -1) {
+        log('info', 'Room is full, rejecting connection');
+        ws.close(1000, 'Room is full');
+        return;
+    }
+    
+    // Add to local tracking
+    ws.roomId = roomId;
+    ws.clientId = clientId;
+    if (!localRooms.has(roomId)) {
+        localRooms.set(roomId, new Set());
+    }
+    localRooms.get(roomId).add(ws);
+    ```
+
+    ### Heartbeat & Connection Monitoring
+
+    ```javascript
+    // From Server/ScalableSignalingServer.js:308-325
+    ws.isAlive = true;
+    const heartbeat = setInterval(() => {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        
+        if (!ws.isAlive) {
+            log('warn', 'Terminating unresponsive client');
+            ws.terminate();
+            return;
+        }
+        
+        ws.isAlive = false;
+        ws.ping();
+    }, config.heartbeatIntervalMs);
+    
+    ws.on('pong', () => {
+        ws.isAlive = true;
+    });
+    ```
+
+    **Default heartbeat interval**: 30 seconds
+
+    ### Graceful Disconnection
+
+    ```javascript
+    // From Server/ScalableSignalingServer.js:441-472
+    async function handleDisconnection(ws, roomKey) {
+        // Clear heartbeat
+        if (ws._heartbeat) clearInterval(ws._heartbeat);
+        
+        // Remove from local map
+        const roomClients = localRooms.get(ws.roomId);
+        if (roomClients) {
+            roomClients.delete(ws);
+            if (roomClients.size === 0) {
+                localRooms.delete(ws.roomId);
+            }
+        }
+        
+        // Remove from Redis and notify peers
+        await atomicLeave(redisClient, roomKey, ws.clientId, config.roomTtlSeconds);
+        await redisClient.publish(roomKey, JSON.stringify({
+            senderId: ws.clientId,
+            data: { type: 'peer-disconnected' }
+        }));
+    }
+    ```
+
+    ### Room Capacity & TTL
+
+    Configurable via environment variables:
+
+    ```bash
+    # Maximum clients per room
+    ROOM_CAPACITY=10
+    
+    # Room data expiration (Redis TTL)
+    ROOM_TTL_SECONDS=3600
+    ```
+  </Tab>
+
+  <Tab title="Health & Metrics">
+    ## Health Checks & Monitoring
+
+    ### Railway-Compatible Endpoints
+
+    ```javascript
+    // From Server/ScalableSignalingServer.js:94-122
+    const httpServer = http.createServer(async (req, res) => {
+        // Liveness probe (always healthy if process is running)
+        if (req.url === '/healthz') {
+            res.writeHead(200, { 'Content-Type': 'text/plain' });
+            res.end('ok');
+            return;
+        }
+        
+        // Readiness probe (checks Redis connection)
+        if (req.url === '/readyz') {
+            try {
+                const pong = await redisClient.ping();
+                if (pong === 'PONG' && !draining) {
+                    res.writeHead(200, { 'Content-Type': 'text/plain' });
+                    res.end('ready');
+                } else {
+                    res.writeHead(503, { 'Content-Type': 'text/plain' });
+                    res.end('not-ready');
+                }
+            } catch (_) {
+                res.writeHead(503, { 'Content-Type': 'text/plain' });
+                res.end('not-ready');
+            }
+            return;
+        }
+        
+        // Prometheus-style metrics
+        if (req.url === '/metrics') {
+            return metricsHandler(req, res);
+        }
+    });
+    ```
+
+    ### Prometheus Metrics
+
+    ```javascript
+    // From Server/metrics.js (referenced in ScalableSignalingServer.js:9-22)
+    const metrics = {
+        activeConnections: new Counter('active_connections'),
+        localRooms: new Counter('local_rooms'),
+        messagesForwarded: new Counter('messages_forwarded'),
+        schemaRejects: new Counter('schema_rejects'),
+        rateLimitDrops: new Counter('rate_limit_drops'),
+        backpressureCloses: new Counter('backpressure_closes'),
+        redisLatency: new Histogram('redis_latency_ms'),
+        fanoutLatency: new Histogram('fanout_latency_ms')
+    };
+    ```
+
+    ### Circuit Breaker
+
+    ```javascript
+    // From Server/ScalableSignalingServer.js:67-84
+    let redisFailureCount = 0;
+    let redisCircuitOpenUntil = 0;
+    
+    function noteRedisFailure() {
+        redisFailureCount += 1;
+        if (redisFailureCount >= config.cbErrorThreshold) {
+            redisCircuitOpenUntil = Date.now() + config.cbOpenMs;
+            setCircuitBreakerOpen(true);
+            log('warn', 'Redis circuit opened', { until: redisCircuitOpenUntil });
+        }
+    }
+    
+    function noteRedisSuccess() {
+        redisFailureCount = 0;
+        if (redisCircuitOpenUntil && Date.now() >= redisCircuitOpenUntil) {
+            redisCircuitOpenUntil = 0;
+            setCircuitBreakerOpen(false);
+        }
+    }
+    ```
+
+    **Circuit breaker settings**:
+    - Threshold: 3 consecutive failures
+    - Open duration: 5000ms
+    - Prevents cascade failures when Redis is unavailable
+  </Tab>
+</Tabs>
+
+## Configuration
+
+### Environment Variables
+
+```bash
+# Server
+PORT=3002                              # HTTP + WebSocket port
+NODE_ENV=production                    # Environment mode
+
+# Redis
+REDIS_URL=redis://localhost:6379      # Redis connection URL
+
+# Security
+REQUIRE_WSS=true                       # Force WSS in production
+ALLOWED_ORIGINS=https://example.com    # CORS origins (comma-separated)
+SUBPROTOCOL=cloudgaming-v1            # WebSocket subprotocol
+
+# Rate Limiting
+RATE_LIMIT_CONN_PER_10S=10            # Connection attempts per IP
+RATE_LIMIT_IP_MSGS_PER_10S=500        # Messages per IP
+RATE_LIMIT_ROOM_MSGS_PER_10S=1000     # Messages per room
+
+# Capacity
+ROOM_CAPACITY=10                       # Max clients per room
+ROOM_TTL_SECONDS=3600                  # Redis key expiration
+MESSAGE_MAX_BYTES=65536               # Max message size
+BACKPRESSURE_THRESHOLD_BYTES=1048576  # Backpressure limit
+
+# Monitoring
+HEARTBEAT_INTERVAL_MS=30000           # Ping interval
+DRAIN_TIMEOUT_MS=5000                 # Graceful shutdown timeout
+```
+
+### Authentication (Optional)
+
+```bash
+# JWT Authentication
+ENABLE_AUTH=true
+JWT_SECRET=your-secret-key
+JWT_ISSUER=cloudgaming-issuer
+JWT_AUDIENCE=cloudgaming-audience
+JWT_ALG=HS256
+JWT_ROOMS_CLAIM=rooms                 # JWT claim containing allowed rooms
+
+# Or JWKS URL for validation
+JWT_JWKS_URL=https://auth.example.com/.well-known/jwks.json
+```
+
+## Key Source Files
+
+<CardGroup cols={2}>
+  <Card title="ScalableSignalingServer.js" icon="server" href="https://github.com/yourusername/cloudgaming/blob/main/Server/ScalableSignalingServer.js">
+    Main signaling server implementation with WebSocket and Redis integration.
+  </Card>
+  
+  <Card title="config.js" icon="gear" href="https://github.com/yourusername/cloudgaming/blob/main/Server/config.js">
+    Configuration loader with environment variable parsing and defaults.
+  </Card>
+  
+  <Card title="validation.js" icon="shield-check" href="https://github.com/yourusername/cloudgaming/blob/main/Server/validation.js">
+    Message schema validation using Zod for type safety.
+  </Card>
+  
+  <Card title="rateLimiter.js" icon="gauge" href="https://github.com/yourusername/cloudgaming/blob/main/Server/rateLimiter.js">
+    Redis-backed token bucket rate limiter implementation.
+  </Card>
+</CardGroup>
+
+<Note>
+  **Deployment Tips:**
+  - Use Redis Cluster for high availability
+  - Deploy multiple server instances behind a load balancer
+  - Monitor `/metrics` endpoint with Prometheus
+  - Set `REQUIRE_WSS=true` in production
+</Note>

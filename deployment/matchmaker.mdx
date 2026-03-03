@@ -1,0 +1,660 @@
+---
+title: Matchmaker Service
+description: Deploy the matchmaker service for host registration and client session assignment
+---
+
+## Overview
+
+The matchmaker service manages the pool of available Windows hosts and assigns clients to hosts for streaming sessions.
+
+**Key responsibilities**:
+- Accept host registrations with heartbeat mechanism
+- Track host availability (idle/busy/offline)
+- Match clients to available hosts based on region and capacity
+- Provide ICE server configuration (STUN/TURN) to clients
+- Health monitoring and stale host cleanup
+
+## Architecture
+
+```
+┌──────────────┐
+│ Windows Host │────┐
+└──────────────┘    │  POST /api/host/heartbeat
+                    │  (every 20s, Bearer token)
+┌──────────────┐    │
+│ Windows Host │────┼────▶┌──────────────┐
+└──────────────┘    │     │              │
+                    ├────▶│  Matchmaker  │◀────┐
+┌──────────────┐    │     │   (Express)  │     │
+│ Windows Host │────┘     └──────┬───────┘     │
+└──────────────┘                 │              │
+                                 │              │
+                            ┌────▼────┐   POST /api/match/find
+                            │  Redis  │    (client request)
+                            └─────────┘         │
+                                                │
+                                        ┌───────┴────────┐
+                                        │ Browser Client │
+                                        └────────────────┘
+```
+
+## Requirements
+
+- Node.js 16+ and npm
+- Redis 6+ (shared with signaling server)
+- 512 MB RAM minimum
+- HTTP hosting (Railway, Heroku, Vercel, etc.)
+
+## Installation
+
+The matchmaker is located in `Server/mm_server/`:
+
+```bash
+cd Server
+npm install  # Same dependencies as signaling server
+```
+
+## Configuration
+
+### Environment Variables
+
+The matchmaker uses the same `config.js` as the signaling server. Configure these variables:
+
+<CodeGroup>
+
+```bash Local Development
+# Matchmaker Port
+PORT=3000
+
+# Redis Connection
+REDIS_URL=redis://127.0.0.1:6379
+
+# Host Authentication
+HOST_SECRET=HELLO-MFS
+HOST_SECRET_PREVIOUS=  # Optional: for secret rotation
+
+# Signaling Server Public URL
+SIGNALING_PUBLIC_URL=ws://localhost:3002
+
+# TURN/STUN Configuration (optional)
+METERED_DOMAIN=
+METERED_API_KEY=
+TURN_EXPIRY_SECONDS=14400
+```
+
+```bash Production
+# Matchmaker Port (auto-set by Railway/Heroku)
+PORT=8080
+
+# Redis Connection
+REDIS_URL=redis://default:password@redis.railway.internal:6379
+
+# Host Authentication
+HOST_SECRET=your-secure-random-secret-here
+HOST_SECRET_PREVIOUS=  # Previous secret during rotation
+
+# Signaling Server Public URL
+SIGNALING_PUBLIC_URL=wss://signaling.yourdomain.com
+
+# TURN/STUN Configuration (Metered.ca)
+METERED_DOMAIN=yourdomain
+METERED_API_KEY=your_metered_api_key
+TURN_EXPIRY_SECONDS=14400
+```
+
+</CodeGroup>
+
+### Configuration Reference
+
+| Variable | Type | Description | Default |
+|----------|------|-------------|----------|
+| `PORT` | number | HTTP API port | `3000` (Railway/Heroku auto-inject) |
+| `REDIS_URL` | string | Redis connection URL | `redis://127.0.0.1:6379` |
+| `HOST_SECRET` | string | Shared secret for host authentication | `to-change-in-prod` |
+| `HOST_SECRET_PREVIOUS` | string | Previous secret for rotation | - |
+| `SIGNALING_PUBLIC_URL` | string | Public WebSocket URL returned to clients | Required in production |
+| `METERED_DOMAIN` | string | Metered.ca domain for TURN servers | - |
+| `METERED_API_KEY` | string | Metered.ca API key | - |
+| `TURN_EXPIRY_SECONDS` | number | TURN credential lifetime | `14400` (4 hours) |
+
+<Warning>
+**CRITICAL**: Change `HOST_SECRET` before production deployment!
+
+This secret authenticates Windows hosts. Use a strong random value:
+```bash
+node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+```
+</Warning>
+
+## Running Locally
+
+<Steps>
+
+<Step title="Ensure Redis is running">
+```bash
+redis-server
+
+# Or with Docker
+docker run -d -p 6379:6379 redis:7-alpine
+```
+</Step>
+
+<Step title="Start the matchmaker">
+```bash
+cd Server
+node mm_server/Matchmaker.js
+```
+
+You should see:
+```
+Matchmaker server is running on port 3000 (0.0.0.0)
+Connected to Redis
+```
+</Step>
+
+<Step title="Test the API">
+```bash
+# Health check
+curl http://localhost:3000/health
+# Response: ok
+
+# List available hosts
+curl http://localhost:3000/api/hosts
+# Response: []
+```
+</Step>
+
+</Steps>
+
+## API Reference
+
+### POST /api/host/heartbeat
+
+Hosts send heartbeats to register and maintain availability.
+
+**Authentication**: Bearer token with `HOST_SECRET`
+
+**Request**:
+```json
+{
+  "hostId": "host-abc-123",
+  "roomId": "room-abc-123",
+  "region": "us-east",
+  "status": "idle",
+  "capacity": 1,
+  "availableSlots": 1
+}
+```
+
+**Response**:
+```json
+{
+  "success": true,
+  "ttl": 30
+}
+```
+
+**Parameters**:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `hostId` | string (UUID) | Yes | Unique host identifier |
+| `roomId` | string | Yes | WebRTC room ID for this host |
+| `region` | string | No | Geographic region (e.g., `us-east`, `eu-west`) |
+| `status` | enum | No | Host status: `idle`, `busy`, or `allocated` |
+| `capacity` | number | No | Max concurrent sessions (default: 1) |
+| `availableSlots` | number | No | Current available slots (default: capacity) |
+
+<Note>
+Hosts must send heartbeats **every 20-25 seconds**. If no heartbeat is received for 30 seconds, the host is removed from the available pool.
+</Note>
+
+**Example (curl)**:
+```bash
+curl -X POST http://localhost:3000/api/host/heartbeat \
+  -H "Authorization: Bearer HELLO-MFS" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "hostId": "host-123",
+    "roomId": "room-123",
+    "region": "us-east",
+    "capacity": 1,
+    "availableSlots": 1
+  }'
+```
+
+### POST /api/match/find
+
+Clients request a host assignment for a streaming session.
+
+**No authentication required** (public endpoint)
+
+**Request**:
+```json
+{
+  "region": "us-east",
+  "hostId": "host-specific-id"  // Optional: request specific host
+}
+```
+
+**Response (success)**:
+```json
+{
+  "found": true,
+  "roomId": "room-abc-123",
+  "signalingUrl": "wss://signaling.yourdomain.com",
+  "iceServers": [
+    { "urls": "stun:stun.l.google.com:19302" },
+    {
+      "urls": "turn:turn.metered.ca:443",
+      "username": "abc123",
+      "credential": "xyz789"
+    }
+  ]
+}
+```
+
+**Response (no hosts available)**:
+```json
+{
+  "found": false,
+  "message": "No hosts available"
+}
+```
+
+**Matching algorithm**:
+1. Sample up to 50 random hosts from Redis
+2. Filter by region (if specified) with 5x weight preference
+3. Select host with available capacity using weighted random
+4. Atomically decrement `availableSlots` using Redis transactions
+5. Return room ID and signaling configuration
+
+**Example (curl)**:
+```bash
+curl -X POST http://localhost:3000/api/match/find \
+  -H "Content-Type: application/json" \
+  -d '{ "region": "us-east" }'
+```
+
+### GET /api/hosts
+
+List all available hosts (for monitoring).
+
+**Response**:
+```json
+[
+  {
+    "hostId": "host-123",
+    "roomId": "room-123",
+    "region": "us-east",
+    "status": "idle",
+    "capacity": 1,
+    "availableSlots": 1,
+    "lastHeartbeat": 1678901234567
+  }
+]
+```
+
+### GET /api/hosts/ttl
+
+Get TTL (time-to-live) for all hosts (debugging).
+
+**Response**:
+```json
+[
+  { "hostId": "host-123", "ttlSeconds": 28 },
+  { "hostId": "host-456", "ttlSeconds": 15 }
+]
+```
+
+### Health Endpoints
+
+- `GET /` - Returns `ok`
+- `GET /health` - Returns 200 with `ok`
+- `GET /healthz` - Returns 200 (for Railway/K8s)
+- `GET /readyz` - Returns 200 (for Railway/K8s)
+
+## Deploying to Production
+
+### Railway Deployment
+
+<Steps>
+
+<Step title="Create a separate Railway service">
+```bash
+railway init
+```
+
+Or add to existing project:
+```
+Railway Dashboard → New → Empty Service
+```
+</Step>
+
+<Step title="Link to the same Redis instance">
+In Railway dashboard:
+```
+Matchmaker service → Variables → Reference Variables
+→ Add REDIS_URL from Redis service
+```
+
+Both signaling and matchmaker should share the same Redis instance.
+</Step>
+
+<Step title="Set environment variables">
+```bash
+HOST_SECRET=<strong-random-secret>
+SIGNALING_PUBLIC_URL=wss://signaling.yourdomain.com
+METERED_DOMAIN=<your-metered-domain>
+METERED_API_KEY=<your-metered-key>
+```
+</Step>
+
+<Step title="Deploy with custom start command">
+Railway settings → Deploy → Custom Start Command:
+```bash
+node mm_server/Matchmaker.js
+```
+
+Or add to `package.json`:
+```json
+{
+  "scripts": {
+    "start:matchmaker": "node mm_server/Matchmaker.js"
+  }
+}
+```
+</Step>
+
+<Step title="Note the deployment URL">
+Railway provides a URL like:
+```
+https://matchmaker-production-5b36.up.railway.app
+```
+
+Update this URL in:
+- Windows host `config.json`: `host.matchmaker.url`
+- Client `config.json`: `client.matchmakerUrl`
+</Step>
+
+</Steps>
+
+### Docker Deployment
+
+Create `Dockerfile.matchmaker` in `Server/`:
+
+```dockerfile
+FROM node:18-alpine
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci --only=production
+
+COPY . .
+
+EXPOSE 3000
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s \
+  CMD node -e "require('http').get('http://localhost:'+process.env.PORT+'/health', (r) => process.exit(r.statusCode === 200 ? 0 : 1))"
+
+CMD ["node", "mm_server/Matchmaker.js"]
+```
+
+Build and run:
+```bash
+docker build -f Dockerfile.matchmaker -t cloudgaming-matchmaker .
+
+docker run -d \
+  -p 3000:3000 \
+  -e REDIS_URL=redis://host.docker.internal:6379 \
+  -e HOST_SECRET=your-secret \
+  -e SIGNALING_PUBLIC_URL=wss://signaling.yourdomain.com \
+  cloudgaming-matchmaker
+```
+
+### Serverless / Edge Deployment
+
+<Warning>
+The matchmaker requires Redis for state management and is **not suitable for truly stateless serverless** (AWS Lambda, Vercel Serverless Functions).
+
+However, it works well on:
+- Railway (recommended)
+- Heroku
+- Google Cloud Run
+- AWS ECS/Fargate
+- Fly.io
+</Warning>
+
+## TURN Server Configuration
+
+For clients behind restrictive NATs, TURN servers are required for WebRTC connectivity.
+
+### Using Metered.ca (Recommended)
+
+Metered.ca provides managed TURN servers with automatic credential rotation:
+
+<Steps>
+
+<Step title="Sign up for Metered.ca">
+Visit [metered.ca](https://www.metered.ca/) and create an account.
+</Step>
+
+<Step title="Get your credentials">
+From the dashboard, note:
+- **Domain**: Your subdomain (e.g., `yourcompany`)
+- **API Key**: Secret key for generating credentials
+</Step>
+
+<Step title="Configure environment variables">
+```bash
+METERED_DOMAIN=yourcompany
+METERED_API_KEY=your-api-key-here
+TURN_EXPIRY_SECONDS=14400
+```
+</Step>
+
+</Steps>
+
+The matchmaker will automatically:
+1. Generate short-lived TURN credentials when a client requests a match
+2. Return ICE servers including both STUN and TURN
+3. Credentials expire after 4 hours (configurable)
+
+### Self-Hosted TURN (coturn)
+
+For self-hosting, use [coturn](https://github.com/coturn/coturn):
+
+```bash
+# Install coturn
+sudo apt-get install coturn
+
+# Configure /etc/turnserver.conf
+realm=turn.yourdomain.com
+listening-ip=0.0.0.0
+external-ip=YOUR_PUBLIC_IP
+min-port=49152
+max-port=65535
+user=username:password
+lt-cred-mech
+
+# Start coturn
+sudo systemctl enable coturn
+sudo systemctl start coturn
+```
+
+Then modify `mm_server/Matchmaker.js` to return your TURN server:
+
+```javascript
+const iceServers = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  {
+    urls: 'turn:turn.yourdomain.com:3478',
+    username: 'username',
+    credential: 'password'
+  }
+];
+```
+
+## Monitoring and Debugging
+
+### Redis Inspection
+
+Monitor Redis state:
+
+```bash
+# Connect to Redis
+redis-cli
+
+# List all idle hosts
+SMEMBERS idle_hosts
+
+# Get host details
+GET host:host-123
+
+# Check host TTL
+TTL host:host-123
+
+# Monitor real-time commands
+MONITOR
+```
+
+### Logs
+
+Key log messages:
+
+```javascript
+// Host heartbeat accepted
+{ level: 'info', message: 'Heartbeat accepted', hostId: 'host-123', status: 'idle' }
+
+// Client matched to host
+{ level: 'info', message: 'Transaction results', hostId: 'host-123', remainingSlots: 0 }
+
+// No hosts available
+{ level: 'warn', message: 'No hosts available' }
+
+// Stale hosts pruned
+{ level: 'info', message: 'Pruned stale idle hosts', staleCount: 3 }
+```
+
+### Testing Host Registration
+
+Simulate a host:
+
+```bash
+# Send heartbeat
+curl -X POST http://localhost:3000/api/host/heartbeat \
+  -H "Authorization: Bearer HELLO-MFS" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "hostId": "test-host-1",
+    "roomId": "test-room-1",
+    "region": "local",
+    "capacity": 1,
+    "availableSlots": 1
+  }'
+
+# Verify it appears in host list
+curl http://localhost:3000/api/hosts
+
+# Request a match
+curl -X POST http://localhost:3000/api/match/find \
+  -H "Content-Type: application/json" \
+  -d '{}'
+
+# Should return the test host
+```
+
+Use `Server/mm_server/simulate_hosts.js` for automated testing:
+
+```bash
+node Server/mm_server/simulate_hosts.js
+```
+
+## Troubleshooting
+
+<AccordionGroup>
+
+<Accordion title="Error: Forbidden - Invalid host secret">
+**Cause**: `HOST_SECRET` mismatch between host and matchmaker
+
+**Solution**: Ensure both use the same secret:
+- Matchmaker `.env`: `HOST_SECRET=HELLO-MFS`
+- Host `config.json`: `host.matchmaker.hostSecret: "HELLO-MFS"`
+</Accordion>
+
+<Accordion title="Hosts timing out after 30 seconds">
+**Cause**: Heartbeat interval too long or hosts not sending heartbeats
+
+**Solution**:
+- Verify host is running and connected
+- Check host logs for heartbeat send confirmations
+- Ensure `heartbeatIntervalMs` in host config is under 25000 (25s)
+- Network issues may prevent heartbeats from reaching matchmaker
+</Accordion>
+
+<Accordion title="Match requests always return 'No hosts available'">
+**Diagnosis**:
+```bash
+# Check if hosts are registered
+curl http://localhost:3000/api/hosts
+
+# Check Redis
+redis-cli SMEMBERS idle_hosts
+```
+
+**Causes**:
+- No hosts have sent heartbeats
+- All hosts are busy (`availableSlots: 0`)
+- Hosts have expired (no heartbeat for 30+ seconds)
+- Region mismatch (client requests `us-east`, all hosts are `eu-west`)
+</Accordion>
+
+<Accordion title="TURN credentials not working">
+**Diagnosis**: Check ICE servers returned by `/api/match/find`
+
+**Solutions**:
+- Verify `METERED_DOMAIN` and `METERED_API_KEY` are correct
+- Check Metered.ca dashboard for usage/errors
+- Test TURN server directly with [Trickle ICE](https://webrtc.github.io/samples/src/content/peerconnection/trickle-ice/)
+- Ensure TURN ports (typically 3478, 443) are not blocked
+</Accordion>
+
+<Accordion title="High Redis memory usage">
+**Cause**: Stale host entries accumulating
+
+**Solution**: The matchmaker automatically prunes stale hosts every 10 seconds. If memory still grows:
+
+```bash
+# Manual cleanup (Redis CLI)
+SCAN 0 MATCH host:* COUNT 100
+# For each key, check TTL and delete if -2 (expired)
+
+# Or flush all host data (DESTRUCTIVE)
+DEL idle_hosts
+SCAN 0 MATCH host:* COUNT 1000 | xargs redis-cli DEL
+```
+</Accordion>
+
+</AccordionGroup>
+
+## Security Best Practices
+
+<Warning>
+Production security checklist:
+
+- Generate a strong `HOST_SECRET`: `openssl rand -base64 32`
+- Use HTTPS for the matchmaker API
+- Restrict `/api/host/*` endpoints to internal network (if possible)
+- Rate limit `/api/match/find` to prevent abuse
+- Enable CORS only for your client domain
+- Monitor for abnormal host registration patterns
+- Rotate `HOST_SECRET` periodically using `HOST_SECRET_PREVIOUS`
+- Use managed Redis with authentication and encryption in transit
+</Warning>
+
+## Next Steps
+
+- [Host Setup](/deployment/host-setup) - Configure Windows hosts to register with this matchmaker
+- [Client Deployment](/deployment/client) - Configure client to use this matchmaker for host discovery
+- [Signaling Server](/deployment/signaling-server) - Ensure signaling server is configured and accessible

@@ -1,0 +1,644 @@
+---
+title: Signaling Server
+description: Deploy the Node.js WebRTC signaling server with Redis pub/sub for horizontal scaling
+---
+
+## Overview
+
+The signaling server coordinates WebRTC connections between Windows hosts and browser clients. It uses WebSocket for real-time communication and Redis pub/sub for multi-instance coordination.
+
+**Key features**:
+- WebSocket signaling for SDP and ICE candidate exchange
+- Redis pub/sub for scaling across multiple instances
+- Rate limiting and circuit breakers
+- Health checks and Prometheus metrics
+- JWT authentication (optional)
+
+## Requirements
+
+- Node.js 16+ and npm
+- Redis 6+ (required for production, single instance OK for development)
+- 1-2 GB RAM per instance
+- WebSocket-capable hosting (Railway, Heroku, AWS, GCP, etc.)
+
+## Installation
+
+<Steps>
+
+<Step title="Navigate to the Server directory">
+```bash
+cd Server
+```
+</Step>
+
+<Step title="Install dependencies">
+```bash
+npm install
+```
+
+This installs:
+- `ws` - WebSocket server
+- `redis` - Redis client with pub/sub support
+- `express` - HTTP server for health checks
+- `pino` - Structured logging
+- `zod` - Schema validation
+- `jsonwebtoken` / `jose` - JWT authentication (optional)
+</Step>
+
+</Steps>
+
+## Configuration
+
+### Environment Variables
+
+Create a `.env` file in the `Server/` directory:
+
+<CodeGroup>
+
+```bash Local Development
+# Server Configuration
+NODE_ENV=development
+WS_PORT=3002
+
+# Redis Connection
+REDIS_URL=redis://127.0.0.1:6379
+
+# Room Settings
+ROOM_CAPACITY=2
+ROOM_TTL_SECONDS=120
+ROOM_ID_MAX_LENGTH=64
+
+# WebSocket Settings
+MESSAGE_MAX_BYTES=262144
+BACKPRESSURE_CLOSE_THRESHOLD_BYTES=5242880
+HEARTBEAT_INTERVAL_MS=30000
+
+# Rate Limiting
+RATE_LIMIT_CONN_PER_10S=20
+RATE_LIMIT_MESSAGES_PER_10S=200
+RATE_LIMIT_IP_MSGS_PER_10S=400
+RATE_LIMIT_ROOM_MSGS_PER_10S=800
+
+# Circuit Breaker
+CB_ERROR_THRESHOLD=5
+CB_OPEN_MS=10000
+
+# Logging
+LOG_LEVEL=info
+PRETTY_LOGS=true
+```
+
+```bash Production (Railway/Heroku)
+# Server Configuration
+NODE_ENV=production
+# PORT is auto-injected by Railway/Heroku
+
+# Redis Connection (use your managed Redis URL)
+REDIS_URL=redis://default:password@redis.railway.internal:6379
+
+# Security
+REQUIRE_WSS=true
+ALLOWED_ORIGINS=https://yourgame.com,https://www.yourgame.com
+
+# Room Settings
+ROOM_CAPACITY=2
+ROOM_TTL_SECONDS=120
+
+# WebSocket Settings
+MESSAGE_MAX_BYTES=262144
+BACKPRESSURE_CLOSE_THRESHOLD_BYTES=5242880
+HEARTBEAT_INTERVAL_MS=30000
+
+# Rate Limiting (stricter for production)
+RATE_LIMIT_CONN_PER_10S=10
+RATE_LIMIT_MESSAGES_PER_10S=200
+RATE_LIMIT_IP_MSGS_PER_10S=300
+RATE_LIMIT_ROOM_MSGS_PER_10S=600
+
+# Circuit Breaker
+CB_ERROR_THRESHOLD=5
+CB_OPEN_MS=10000
+
+# Logging
+LOG_LEVEL=warn
+PRETTY_LOGS=false
+```
+
+```bash JWT Authentication
+# Enable JWT authentication
+ENABLE_AUTH=true
+
+# Option 1: Symmetric key (HS256)
+JWT_ALG=HS256
+JWT_SECRET=your-secret-key-here
+JWT_ISSUER=https://auth.yourdomain.com
+JWT_AUDIENCE=cloudgaming
+
+# Option 2: JWKS (RS256) - for Auth0, Clerk, etc.
+JWT_ALG=RS256
+JWKS_URL=https://yourdomain.auth0.com/.well-known/jwks.json
+JWT_ISSUER=https://yourdomain.auth0.com/
+JWT_AUDIENCE=cloudgaming
+
+# JWT room authorization claim
+ROOMS_CLAIM=rooms
+```
+
+</CodeGroup>
+
+### Configuration Reference
+
+#### Core Settings
+
+| Variable | Type | Description | Default |
+|----------|------|-------------|----------|
+| `NODE_ENV` | string | Environment mode | `development` |
+| `WS_PORT` | number | WebSocket port (local dev only) | `3002` |
+| `PORT` | number | HTTP/WS port (auto-set by hosting platforms) | - |
+| `REDIS_URL` | string | Redis connection URL | `redis://127.0.0.1:6379` |
+
+<Note>
+Railway, Heroku, and similar platforms automatically inject the `PORT` environment variable. The server listens on `PORT` if available, falling back to `WS_PORT`.
+</Note>
+
+#### Room Settings
+
+| Variable | Type | Description | Default |
+|----------|------|-------------|----------|
+| `ROOM_CAPACITY` | number | Max clients per room | `2` |
+| `ROOM_TTL_SECONDS` | number | Room expiration time after last member leaves | `120` |
+| `ROOM_ID_MAX_LENGTH` | number | Maximum room ID length | `64` |
+
+#### WebSocket Settings
+
+| Variable | Type | Description | Default |
+|----------|------|-------------|----------|
+| `MESSAGE_MAX_BYTES` | number | Max message size (bytes) | `262144` (256 KB) |
+| `BACKPRESSURE_CLOSE_THRESHOLD_BYTES` | number | Close connection if buffer exceeds this | `5242880` (5 MB) |
+| `HEARTBEAT_INTERVAL_MS` | number | Ping interval to detect dead connections | `30000` (30s) |
+
+#### Rate Limiting
+
+| Variable | Type | Description | Default |
+|----------|------|-------------|----------|
+| `RATE_LIMIT_CONN_PER_10S` | number | Max new connections per IP per 10s | `20` |
+| `RATE_LIMIT_MESSAGES_PER_10S` | number | Max messages per client per 10s | `200` |
+| `RATE_LIMIT_IP_MSGS_PER_10S` | number | Max messages per IP per 10s | `400` |
+| `RATE_LIMIT_ROOM_MSGS_PER_10S` | number | Max messages per room per 10s | `800` |
+
+#### Security
+
+| Variable | Type | Description | Default |
+|----------|------|-------------|----------|
+| `REQUIRE_WSS` | boolean | Reject non-WSS connections in production | `false` |
+| `ALLOWED_ORIGINS` | string | Comma-separated list of allowed origins | `` (all) |
+| `SUBPROTOCOL` | string | Required WebSocket subprotocol | - |
+
+## Running Locally
+
+<Steps>
+
+<Step title="Start Redis">
+```bash
+redis-server
+```
+
+Or with Docker:
+```bash
+docker run -d -p 6379:6379 redis:7-alpine
+```
+</Step>
+
+<Step title="Start the signaling server">
+```bash
+# Production mode
+npm start
+
+# Development mode (pretty logs)
+npm run dev
+```
+
+The server will start on port 3002 (or the port specified by `PORT` env var).
+</Step>
+
+<Step title="Verify it's running">
+```bash
+# Health check
+curl http://localhost:3002/healthz
+# Should return: ok
+
+# Readiness check (verifies Redis connection)
+curl http://localhost:3002/readyz
+# Should return: ready
+
+# Metrics (Prometheus format)
+curl http://localhost:3002/metrics
+```
+</Step>
+
+</Steps>
+
+### Testing WebSocket Connection
+
+Test the WebSocket endpoint:
+
+```javascript
+const ws = new WebSocket('ws://localhost:3002?roomId=test-room');
+
+ws.onopen = () => console.log('Connected');
+ws.onmessage = (event) => console.log('Message:', event.data);
+ws.onerror = (error) => console.error('Error:', error);
+```
+
+## Deploying to Production
+
+### Railway Deployment
+
+<Steps>
+
+<Step title="Create a new Railway project">
+```bash
+# Install Railway CLI
+npm install -g @railway/cli
+
+# Login
+railway login
+
+# Initialize project
+railway init
+```
+</Step>
+
+<Step title="Add Redis service">
+In the Railway dashboard:
+```
+New → Database → Redis
+```
+
+Railway will automatically inject `REDIS_URL` as an environment variable.
+</Step>
+
+<Step title="Configure environment variables">
+In Railway dashboard, add these variables:
+
+```bash
+NODE_ENV=production
+REQUIRE_WSS=true
+ALLOWED_ORIGINS=https://yourgame.com
+LOG_LEVEL=warn
+ROOM_CAPACITY=2
+```
+</Step>
+
+<Step title="Deploy">
+```bash
+cd Server
+railway up
+```
+
+Railway will:
+- Detect the Node.js application
+- Run `npm install`
+- Execute `npm start`
+- Expose the service on a public URL
+</Step>
+
+<Step title="Note the deployment URL">
+Railway provides a URL like:
+```
+https://signaling-server-production-abc123.up.railway.app
+```
+
+Update your `SIGNALING_PUBLIC_URL` in the matchmaker and host config:
+```
+wss://signaling-server-production-abc123.up.railway.app
+```
+</Step>
+
+</Steps>
+
+### Docker Deployment
+
+Create a `Dockerfile` in the `Server/` directory:
+
+```dockerfile
+FROM node:18-alpine
+
+WORKDIR /app
+
+# Copy package files
+COPY package*.json ./
+
+# Install production dependencies
+RUN npm ci --only=production
+
+# Copy application code
+COPY . .
+
+# Expose port (will be overridden by PORT env var)
+EXPOSE 3002
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s \
+  CMD node -e "require('http').get('http://localhost:'+process.env.PORT+'/healthz', (r) => process.exit(r.statusCode === 200 ? 0 : 1))"
+
+# Start server
+CMD ["npm", "start"]
+```
+
+Build and run:
+
+```bash
+# Build
+docker build -t cloudgaming-signaling .
+
+# Run
+docker run -d \
+  -p 3002:3002 \
+  -e REDIS_URL=redis://host.docker.internal:6379 \
+  -e NODE_ENV=production \
+  cloudgaming-signaling
+```
+
+### Kubernetes / Docker Compose
+
+<Tabs>
+<Tab title="Docker Compose">
+```yaml
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+
+  signaling:
+    build: ./Server
+    ports:
+      - "3002:3002"
+    environment:
+      NODE_ENV: production
+      REDIS_URL: redis://redis:6379
+      ROOM_CAPACITY: 2
+      LOG_LEVEL: info
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+```
+
+Run with:
+```bash
+docker-compose up -d
+```
+</Tab>
+
+<Tab title="Kubernetes">
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: signaling-server
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: signaling
+  template:
+    metadata:
+      labels:
+        app: signaling
+    spec:
+      containers:
+      - name: signaling
+        image: cloudgaming-signaling:latest
+        ports:
+        - containerPort: 3002
+        env:
+        - name: NODE_ENV
+          value: "production"
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: redis-credentials
+              key: url
+        - name: ROOM_CAPACITY
+          value: "2"
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 3002
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 3002
+          initialDelaySeconds: 5
+          periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: signaling-service
+spec:
+  selector:
+    app: signaling
+  ports:
+  - protocol: TCP
+    port: 3002
+    targetPort: 3002
+  type: LoadBalancer
+```
+</Tab>
+</Tabs>
+
+## Horizontal Scaling
+
+The signaling server supports horizontal scaling via Redis pub/sub:
+
+```
+┌─────────┐     ┌─────────┐     ┌─────────┐
+│ Client  │────▶│  LB     │────▶│Instance1│
+└─────────┘     └─────────┘  │  └─────────┘
+                              │       │
+                              │  ┌────▼─────┐
+                              │  │  Redis   │
+                              │  │ Pub/Sub  │
+                              │  └────▲─────┘
+                              │       │
+                              └──▶┌─────────┐
+                                  │Instance2│
+                                  └─────────┘
+```
+
+**How it works**:
+1. Each instance maintains local WebSocket connections
+2. Messages are published to Redis channel `room:{roomId}`
+3. All instances subscribed to that channel receive and forward messages
+4. Local room state is synchronized via Redis atomic operations
+
+<Note>
+No sticky sessions required. Clients can connect to any instance.
+</Note>
+
+### Load Balancing
+
+For multiple instances, use a load balancer with WebSocket support:
+
+- **NGINX**: Enable `proxy_http_version 1.1` and upgrade headers
+- **HAProxy**: Use `option http-server-close`
+- **AWS ALB**: Enable WebSocket support in target group
+- **Railway**: Automatically load balances with 0 configuration
+
+## Monitoring
+
+### Prometheus Metrics
+
+The server exposes metrics at `/metrics`:
+
+```
+# Active WebSocket connections
+cloudgaming_active_connections 42
+
+# Local rooms on this instance
+cloudgaming_local_rooms 21
+
+# Redis connection status (1=up, 0=down)
+cloudgaming_redis_up 1
+
+# Circuit breaker status (1=open, 0=closed)
+cloudgaming_circuit_breaker_open 0
+
+# Message counters
+cloudgaming_messages_forwarded_total 12543
+cloudgaming_schema_rejects_total 7
+cloudgaming_rate_limit_drops_total 23
+
+# Operation latency histograms
+cloudgaming_redis_operation_duration_seconds{...}
+cloudgaming_fanout_duration_seconds{...}
+```
+
+### Health Checks
+
+- **Liveness**: `GET /healthz` - Always returns 200 if server is running
+- **Readiness**: `GET /readyz` - Returns 200 only if Redis is connected and not draining
+
+### Logging
+
+The server uses structured JSON logging (Pino):
+
+```json
+{
+  "level": "info",
+  "time": 1234567890,
+  "msg": "Client joined room",
+  "clientId": "client:abc-123",
+  "roomId": "room-456",
+  "localCount": 2
+}
+```
+
+Set `PRETTY_LOGS=true` for human-readable output during development.
+
+## Troubleshooting
+
+<AccordionGroup>
+
+<Accordion title="Error: Redis connection failed">
+**Symptoms**: Server crashes or readiness check fails
+
+**Solutions**:
+- Verify Redis is running: `redis-cli ping`
+- Check `REDIS_URL` format: `redis://[user:password@]host:port[/db]`
+- Verify network connectivity (firewall, security groups)
+- For Railway: Ensure Redis service is in the same project
+</Accordion>
+
+<Accordion title="Error: EADDRINUSE (port already in use)">
+**Solution**: Change the port or kill the process using it
+
+```bash
+# Find process
+lsof -i :3002
+
+# Kill it
+kill -9 <PID>
+
+# Or use a different port
+export WS_PORT=3003
+npm start
+```
+</Accordion>
+
+<Accordion title="WebSocket connection fails with 426 Upgrade Required">
+**Cause**: Client is making HTTP request instead of WebSocket upgrade
+
+**Solution**: Ensure client uses `ws://` or `wss://` protocol:
+```javascript
+new WebSocket('ws://localhost:3002?roomId=test')
+```
+</Accordion>
+
+<Accordion title="Connection rejected: Origin not allowed">
+**Cause**: `ALLOWED_ORIGINS` is configured but client origin doesn't match
+
+**Solution**: Add client origin to allowed list:
+```bash
+ALLOWED_ORIGINS=https://game.com,https://www.game.com,http://localhost:8080
+```
+</Accordion>
+
+<Accordion title="High memory usage with many connections">
+**Solutions**:
+- Lower `BACKPRESSURE_CLOSE_THRESHOLD_BYTES` to close slow clients faster
+- Enable rate limiting with stricter limits
+- Scale horizontally with more instances
+- Monitor and close inactive connections
+</Accordion>
+
+<Accordion title="Messages not reaching clients on different instances">
+**Cause**: Redis pub/sub not working
+
+**Diagnosis**:
+```bash
+# Monitor Redis pub/sub
+redis-cli
+PSUBSCRIBE room:*
+# Should see messages when clients communicate
+```
+
+**Solutions**:
+- Verify all instances use the same `REDIS_URL`
+- Check Redis logs for errors
+- Ensure Redis allows pub/sub (not in cluster mode with restrictions)
+</Accordion>
+
+</AccordionGroup>
+
+## Security Best Practices
+
+<Warning>
+For production deployments:
+
+- Always use WSS (secure WebSocket): `REQUIRE_WSS=true`
+- Restrict origins: `ALLOWED_ORIGINS=https://yourgame.com`
+- Enable JWT authentication for sensitive applications
+- Use managed Redis with authentication and encryption
+- Monitor rate limit violations
+- Set up alerts for circuit breaker openings
+- Keep dependencies updated: `npm audit`
+</Warning>
+
+## Next Steps
+
+- [Matchmaker Deployment](/deployment/matchmaker) - Set up host registration and matching
+- [Host Setup](/deployment/host-setup) - Configure Windows hosts to connect to this signaling server
+- [Client Deployment](/deployment/client) - Deploy the browser client

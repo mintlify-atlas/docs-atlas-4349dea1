@@ -1,0 +1,379 @@
+---
+title: Network and WebRTC Configuration
+description: Configure signaling servers, matchmaker, ICE/TURN servers, and heartbeat intervals
+---
+
+## Overview
+
+Network configuration controls signaling server connections, matchmaker registration, ICE/TURN server setup for NAT traversal, and keepalive settings.
+
+## Client Configuration
+
+Browser client connection endpoints.
+
+<ParamField path="client.serverUrlBase" type="string" required>
+  WebSocket URL for the signaling server.
+  
+  **Default:** `wss://signaling-server-production-acd4.up.railway.app`
+  
+  Must use `wss://` for secure WebSocket in production.
+  
+  **Examples:**
+  - Development: `ws://localhost:3002`
+  - Production: `wss://signaling.example.com`
+  
+  <Warning>Always use `wss://` (secure WebSocket) in production to avoid security warnings and blocked connections.</Warning>
+</ParamField>
+
+<ParamField path="client.matchmakerUrl" type="string" required>
+  HTTP(S) URL for the matchmaker service.
+  
+  **Default:** `https://matchmaker-production-5b36.up.railway.app`
+  
+  Matchmaker assigns clients to available hosts.
+  
+  **Examples:**
+  - Development: `http://localhost:3000`
+  - Production: `https://matchmaker.example.com`
+</ParamField>
+
+## Host Signaling
+
+<ParamField path="host.signalingUrl" type="string" required>
+  WebSocket URL for host-to-signaling-server connection.
+  
+  **Default:** `wss://signaling-server-production-acd4.up.railway.app`
+  
+  Should match `client.serverUrlBase` to ensure hosts and clients connect to the same signaling server.
+</ParamField>
+
+## Matchmaker Configuration
+
+The matchmaker service manages host registration and client-to-host assignment.
+
+<ParamField path="host.matchmaker.url" type="string" required>
+  HTTP(S) URL for matchmaker endpoint.
+  
+  **Default:** `https://matchmaker-production-5b36.up.railway.app`
+  
+  Host registers itself with this service and maintains keepalive.
+</ParamField>
+
+<ParamField path="host.matchmaker.hostSecret" type="string" required>
+  Shared secret for host authentication.
+  
+  **Default:** `HELLO-MFS`
+  
+  Used to authenticate host registration requests.
+  
+  <Warning>Change this to a secure random value in production! The default is for development only.</Warning>
+  
+  Generate a secure secret:
+  ```bash
+  node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+  ```
+</ParamField>
+
+<ParamField path="host.matchmaker.heartbeatIntervalMs" type="integer" default="20000">
+  Host keepalive interval in milliseconds.
+  
+  **Default:** `20000` (20 seconds)
+  
+  Host sends periodic heartbeats to matchmaker to indicate availability.
+  
+  **Recommended:**
+  - `10000-20000` - Standard (default)
+  - `5000-10000` - Fast failover (higher network traffic)
+  - `30000-60000` - Low traffic (slower failover)
+  
+  <Tip>Set to 2-3x your expected network latency for stable connections.</Tip>
+</ParamField>
+
+## ICE and TURN Configuration
+
+ICE (Interactive Connectivity Establishment) and TURN (Traversal Using Relays around NAT) enable WebRTC connections through firewalls and NAT.
+
+### Default Behavior
+
+The CloudGaming host uses default ICE servers configured in the Pion WebRTC library. For most local networks and direct connections, this is sufficient.
+
+### Custom ICE/TURN Servers
+
+For production deployments or restrictive networks, configure custom TURN servers in your WebRTC connection code.
+
+**Client-side ICE configuration (JavaScript):**
+
+```javascript
+const iceServers = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  {
+    urls: 'turn:turn.example.com:3478',
+    username: 'user',
+    credential: 'pass'
+  }
+];
+
+const pc = new RTCPeerConnection({
+  iceServers: iceServers
+});
+```
+
+**Host-side configuration** requires modifying the Go code in `gortc_main/` to add custom ICE servers to the Pion WebRTC configuration.
+
+### Public STUN Servers
+
+Free STUN servers for NAT traversal (no relay):
+
+- `stun:stun.l.google.com:19302` (Google)
+- `stun:stun1.l.google.com:19302`
+- `stun:stun.cloudflare.com:3478` (Cloudflare)
+
+### TURN Server Setup
+
+For reliable connections through restrictive NATs, deploy your own TURN server:
+
+**Using Coturn:**
+
+```bash
+# Install
+sudo apt-get install coturn
+
+# Configure /etc/turnserver.conf
+listening-port=3478
+fingerprint
+lt-cred-mech
+user=myuser:mypassword
+realm=turn.example.com
+
+# Start
+sudo systemctl start coturn
+```
+
+<Tip>
+  Deploy TURN servers geographically close to your users for best performance.
+</Tip>
+
+## Redis Configuration (Signaling Server)
+
+The signaling server uses Redis for pub/sub and multi-node scaling. Configure Redis connection in the signaling server deployment.
+
+**Environment variables for signaling server:**
+
+```bash
+REDIS_HOST=localhost
+REDIS_PORT=6379
+REDIS_PASSWORD=your_secure_password
+```
+
+<Warning>Always use Redis authentication (`requirepass`) in production deployments.</Warning>
+
+## Network Architecture
+
+### Connection Flow
+
+1. **Client** → Matchmaker: Request available host
+2. **Matchmaker** → Client: Return host ID
+3. **Client** → Signaling: Connect via WebSocket
+4. **Client** ↔ **Host**: Exchange SDP/ICE through signaling
+5. **Client** ↔ **Host**: Establish direct WebRTC P2P connection
+6. **Client** ↔ **Host**: Stream video/audio, receive input
+
+### Components
+
+```
+┌─────────┐          ┌────────────┐          ┌──────┐
+│ Client  │ ◄─────── │ Signaling  │ ◄─────── │ Host │
+│(Browser)│   WSS    │   Server   │   WSS    │ (C++) │
+└─────────┘          └────────────┘          └──────┘
+     │                     │                     │
+     │                     ▼                     │
+     │               ┌──────────┐                │
+     └─────────────► │  Redis   │ ◄──────────────┘
+          HTTP       │ Pub/Sub  │       HTTP
+                     └──────────┘
+     │                                           │
+     │               ┌────────────┐              │
+     └─────────────► │ Matchmaker │ ◄────────────┘
+          HTTP       │  Service   │      HTTP
+                     └────────────┘
+     │                                           │
+     └───────────────────────────────────────────┘
+                    WebRTC P2P
+              (video, audio, input)
+```
+
+## Firewall and Port Configuration
+
+### Required Ports
+
+| Service | Protocol | Port | Direction |
+|---------|----------|------|-----------|
+| Signaling Server | WSS | 3002 (or custom) | Inbound |
+| Matchmaker | HTTPS | 3000 (or custom) | Inbound |
+| STUN | UDP | 3478 | Bidirectional |
+| TURN | UDP/TCP | 3478 | Bidirectional |
+| WebRTC Media | UDP | 10000-65535 | Bidirectional |
+
+### Firewall Rules (Host)
+
+Allow outbound connections:
+- WSS to signaling server
+- HTTPS to matchmaker
+- UDP for WebRTC media
+
+```bash
+# Example iptables (Linux host)
+iptables -A OUTPUT -p tcp --dport 3002 -j ACCEPT  # Signaling
+iptables -A OUTPUT -p tcp --dport 3000 -j ACCEPT  # Matchmaker
+iptables -A OUTPUT -p udp --dport 3478 -j ACCEPT  # STUN/TURN
+iptables -A OUTPUT -p udp -m udp --dport 10000:65535 -j ACCEPT  # WebRTC
+```
+
+<Warning>WebRTC requires bidirectional UDP traffic. Highly restrictive firewalls may block P2P connections, requiring TURN relay.</Warning>
+
+## Production Deployment Checklist
+
+<Check>
+  Use secure protocols (`wss://`, `https://`) for all endpoints
+</Check>
+
+<Check>
+  Change `hostSecret` to a cryptographically secure random value
+</Check>
+
+<Check>
+  Deploy Redis with authentication enabled
+</Check>
+
+<Check>
+  Configure TURN servers for NAT traversal
+</Check>
+
+<Check>
+  Set up SSL/TLS certificates for signaling and matchmaker
+</Check>
+
+<Check>
+  Configure firewall rules to allow required ports
+</Check>
+
+<Check>
+  Set appropriate `heartbeatIntervalMs` for your network
+</Check>
+
+<Check>
+  Test connections from restrictive networks (corporate, mobile)
+</Check>
+
+## Example Configurations
+
+### Local Development
+
+```json
+{
+  "client": {
+    "serverUrlBase": "ws://localhost:3002",
+    "matchmakerUrl": "http://localhost:3000"
+  },
+  "host": {
+    "signalingUrl": "ws://localhost:3002",
+    "matchmaker": {
+      "url": "http://localhost:3000",
+      "hostSecret": "dev-secret-123",
+      "heartbeatIntervalMs": 25000
+    }
+  }
+}
+```
+
+### Production Deployment
+
+```json
+{
+  "client": {
+    "serverUrlBase": "wss://signaling.cloudgaming.example.com",
+    "matchmakerUrl": "https://matchmaker.cloudgaming.example.com"
+  },
+  "host": {
+    "signalingUrl": "wss://signaling.cloudgaming.example.com",
+    "matchmaker": {
+      "url": "https://matchmaker.cloudgaming.example.com",
+      "hostSecret": "YOUR_SECURE_SECRET_HERE",
+      "heartbeatIntervalMs": 20000
+    }
+  }
+}
+```
+
+### High-Availability Setup
+
+```json
+{
+  "client": {
+    "serverUrlBase": "wss://signaling-lb.example.com",
+    "matchmakerUrl": "https://matchmaker-lb.example.com"
+  },
+  "host": {
+    "signalingUrl": "wss://signaling-lb.example.com",
+    "matchmaker": {
+      "url": "https://matchmaker-lb.example.com",
+      "hostSecret": "YOUR_SECURE_SECRET_HERE",
+      "heartbeatIntervalMs": 15000
+    }
+  }
+}
+```
+
+**Additional infrastructure:**
+- Multiple signaling server instances behind load balancer
+- Redis cluster for high availability
+- Multiple matchmaker instances
+- Geographically distributed TURN servers
+
+<Tip>
+  For high-availability deployments, use health checks on the load balancer and reduce `heartbeatIntervalMs` to 10-15 seconds for faster failover.
+</Tip>
+
+## Troubleshooting
+
+### Cannot Connect to Signaling Server
+
+**Check:**
+1. Signaling server is running and accessible
+2. WebSocket URL uses correct protocol (`ws://` vs `wss://`)
+3. Firewall allows outbound connections on signaling port
+4. SSL certificate is valid (for `wss://`)
+
+### Host Not Appearing in Matchmaker
+
+**Check:**
+1. Matchmaker service is running
+2. `hostSecret` matches on host and matchmaker
+3. Host can reach matchmaker URL
+4. Heartbeats are being sent (check logs)
+5. Matchmaker Redis connection is working
+
+### WebRTC Connection Fails (ICE Failed)
+
+**Check:**
+1. STUN/TURN servers are reachable
+2. UDP traffic is not blocked by firewall
+3. NAT type is compatible (symmetric NAT requires TURN)
+4. ICE candidate gathering completes successfully
+5. Consider deploying TURN server for relay
+
+### High Latency
+
+**Check:**
+1. Network RTT between client and host
+2. TURN relay is not being used (adds latency)
+3. Signaling server geographic location
+4. Client/host network quality
+
+### Intermittent Disconnections
+
+**Check:**
+1. `heartbeatIntervalMs` is appropriate for network latency
+2. Redis pub/sub is stable
+3. Load balancer timeout settings
+4. Network stability (packet loss, jitter)

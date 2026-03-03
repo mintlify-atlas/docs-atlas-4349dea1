@@ -1,0 +1,311 @@
+---
+title: Video Encoding Configuration
+description: Configure video capture frame rate, bitrate, NVENC settings, and HDR tone mapping
+---
+
+## Overview
+
+The `host.video` section controls all video encoding parameters including frame rate, bitrate adaptation, hardware encoder settings (NVENC/QSV/AMF), and HDR tone mapping.
+
+## Frame Rate and Timing
+
+<ParamField path="video.fps" type="integer" default="60">
+  Target frames per second for capture and encoding.
+  
+  Higher values provide smoother motion but require more bandwidth and processing power.
+  
+  **Recommended values:**
+  - `30` - Low bandwidth/performance
+  - `60` - Standard gaming
+  - `120` - High refresh rate gaming
+</ParamField>
+
+<ParamField path="video.pacingFixedUs" type="integer" default="16666">
+  Frame pacing interval in microseconds. Should match `1000000 / fps`.
+  
+  For 60 FPS: `16666` μs (1000000 / 60)
+  
+  For 120 FPS: `8333` μs (1000000 / 120)
+</ParamField>
+
+<ParamField path="video.gpuTiming" type="boolean" default="false">
+  Enable GPU encode timing diagnostics. Logs encode duration for performance analysis.
+  
+  <Tip>Enable this when profiling encoder performance or diagnosing frame drops.</Tip>
+</ParamField>
+
+## Bitrate Configuration
+
+<ParamField path="video.bitrateStart" type="integer" default="8000000">
+  Initial encoding bitrate in bits per second (bps).
+  
+  **Default:** `8000000` (8 Mbps)
+  
+  This is the starting point for adaptive bitrate control.
+</ParamField>
+
+<ParamField path="video.bitrateMin" type="integer" default="8000000">
+  Minimum allowed bitrate in bps for adaptive bitrate controller.
+  
+  **Default:** `8000000` (8 Mbps)
+  
+  <Warning>Setting this too low will result in poor visual quality during network congestion.</Warning>
+</ParamField>
+
+<ParamField path="video.bitrateMax" type="integer" default="12000000">
+  Maximum allowed bitrate in bps for adaptive bitrate controller.
+  
+  **Default:** `12000000` (12 Mbps)
+  
+  Higher values improve quality but require more bandwidth.
+</ParamField>
+
+### Bitrate Controller
+
+The adaptive bitrate controller adjusts encoding bitrate based on network conditions.
+
+<ParamField path="video.bitrateController.increaseStepBps" type="integer" default="1000000">
+  Bitrate increase step size in bps when network conditions improve.
+  
+  **Default:** `1000000` (1 Mbps)
+</ParamField>
+
+<ParamField path="video.bitrateController.decreaseCooldownMs" type="integer" default="1000">
+  Cooldown period in milliseconds before allowing bitrate increases after a decrease.
+  
+  **Default:** `1000` ms
+</ParamField>
+
+<ParamField path="video.bitrateController.cleanSamplesRequired" type="integer" default="3">
+  Number of consecutive clean network samples required before increasing bitrate.
+  
+  **Default:** `3`
+</ParamField>
+
+<ParamField path="video.bitrateController.increaseIntervalMs" type="integer" default="1000">
+  Minimum interval in milliseconds between bitrate increases.
+  
+  **Default:** `1000` ms
+</ParamField>
+
+## Hardware Encoder Settings (NVENC)
+
+<ParamField path="video.preset" type="string" default="p2">
+  NVENC encoding preset. Lower numbers = faster encoding, higher latency. Higher numbers = slower encoding, better quality.
+  
+  **Options:** `p1`, `p2`, `p3`, `p4`, `p5`, `p6`, `p7`
+  
+  **Default:** `p2`
+  
+  **Recommended:**
+  - `p1` or `p2` - Low latency gaming (fastest)
+  - `p4` - Balanced quality/performance
+  - `p6` or `p7` - High quality (slowest)
+  
+  <Tip>For competitive gaming, use `p1` or `p2` to minimize encode latency.</Tip>
+</ParamField>
+
+<ParamField path="video.rc" type="string" default="cbr">
+  Rate control mode for the encoder.
+  
+  **Options:**
+  - `cbr` - Constant bitrate (best for streaming)
+  - `vbr` - Variable bitrate (better quality, less predictable)
+  
+  **Default:** `cbr`
+  
+  <Tip>Use CBR for consistent network bandwidth usage and predictable latency.</Tip>
+</ParamField>
+
+<ParamField path="video.bf" type="integer" default="0">
+  Number of B-frames (bidirectional prediction frames).
+  
+  **Default:** `0`
+  
+  <Warning>Keep this at `0` for minimum latency. B-frames add encoding delay.</Warning>
+</ParamField>
+
+<ParamField path="video.rcLookahead" type="integer" default="0">
+  Rate control lookahead in frames. Higher values improve quality but add latency.
+  
+  **Default:** `0`
+  
+  Set to `0` for lowest latency applications.
+</ParamField>
+
+<ParamField path="video.asyncDepth" type="integer" default="2">
+  Asynchronous encoding queue depth.
+  
+  **Default:** `2`
+  
+  Controls how many frames can be queued for encoding simultaneously.
+</ParamField>
+
+<ParamField path="video.surfaces" type="integer" default="3">
+  Number of encode surfaces (GPU memory buffers).
+  
+  **Default:** `3`
+  
+  Must be >= `asyncDepth + 1`.
+</ParamField>
+
+## Color and Range
+
+<ParamField path="video.fullRange" type="boolean" default="false">
+  YUV color range configuration.
+  
+  **Default:** `false` (limited/TV range 16-235)
+  
+  - `false` - Limited range (16-235), standard for video
+  - `true` - Full range (0-255), PC RGB range
+  
+  <Tip>Keep at `false` for best compatibility with video players and browsers.</Tip>
+</ParamField>
+
+## HDR Tone Mapping
+
+When capturing HDR content for SDR displays, tone mapping converts the HDR signal.
+
+<ParamField path="video.hdrToneMapping.enabled" type="boolean" default="false">
+  Enable HDR to SDR tone mapping.
+  
+  **Default:** `false`
+  
+  Enable this when capturing HDR content that will be viewed on SDR displays.
+</ParamField>
+
+<ParamField path="video.hdrToneMapping.method" type="string" default="reinhard">
+  Tone mapping algorithm.
+  
+  **Options:** `reinhard`, `hable`, `linear`
+  
+  **Default:** `reinhard`
+  
+  - `reinhard` - Classic Reinhard operator, preserves bright details
+  - `hable` - Filmic tone mapping (Uncharted 2)
+  - `linear` - Simple linear scaling
+</ParamField>
+
+<ParamField path="video.hdrToneMapping.exposure" type="float" default="0.0">
+  Exposure compensation value.
+  
+  **Default:** `0.0`
+  
+  Adjust brightness: negative values darken, positive values brighten.
+  
+  Range: typically `-2.0` to `2.0`
+</ParamField>
+
+<ParamField path="video.hdrToneMapping.gamma" type="float" default="2.2">
+  Gamma correction value.
+  
+  **Default:** `2.2` (standard sRGB gamma)
+  
+  Adjusts mid-tone brightness. Standard value is `2.2` for sRGB displays.
+</ParamField>
+
+<ParamField path="video.hdrToneMapping.saturation" type="float" default="1.0">
+  Color saturation multiplier.
+  
+  **Default:** `1.0`
+  
+  - `< 1.0` - Desaturate (grayscale at 0.0)
+  - `1.0` - Original saturation
+  - `> 1.0` - Increase saturation
+</ParamField>
+
+## Picture Loss Indication (PLI)
+
+PLI requests trigger full keyframes when the client detects corruption.
+
+<ParamField path="video.ignorePli" type="boolean" default="false">
+  Ignore PLI (Picture Loss Indication) requests from client.
+  
+  **Default:** `false`
+  
+  <Warning>Only set to `true` if experiencing excessive keyframe requests. This may cause visual artifacts.</Warning>
+</ParamField>
+
+<ParamField path="video.minPliIntervalMs" type="integer" default="3000">
+  Minimum interval in milliseconds between processing PLI requests.
+  
+  **Default:** `3000` ms (3 seconds)
+  
+  Prevents excessive keyframe generation from repeated PLI requests.
+</ParamField>
+
+<ParamField path="video.minPliLossThreshold" type="float" default="0.15">
+  Minimum packet loss ratio (0.0-1.0) required to honor a PLI request.
+  
+  **Default:** `0.15` (15% loss)
+  
+  Filters out spurious PLI requests when packet loss is low.
+</ParamField>
+
+## Advanced Settings
+
+<ParamField path="video.hwFramePoolSize" type="integer" default="3">
+  Hardware frame pool size for GPU memory management.
+  
+  **Default:** `3`
+  
+  Number of hardware frames pre-allocated for encoding pipeline.
+</ParamField>
+
+## Example Configurations
+
+### Low Latency Gaming
+
+```json
+{
+  "video": {
+    "fps": 120,
+    "pacingFixedUs": 8333,
+    "bitrateStart": 15000000,
+    "bitrateMin": 10000000,
+    "bitrateMax": 25000000,
+    "preset": "p1",
+    "rc": "cbr",
+    "bf": 0,
+    "rcLookahead": 0,
+    "fullRange": false,
+    "gpuTiming": true
+  }
+}
+```
+
+### High Quality Streaming
+
+```json
+{
+  "video": {
+    "fps": 60,
+    "pacingFixedUs": 16666,
+    "bitrateStart": 20000000,
+    "bitrateMin": 15000000,
+    "bitrateMax": 40000000,
+    "preset": "p5",
+    "rc": "vbr",
+    "bf": 0,
+    "fullRange": false
+  }
+}
+```
+
+### HDR to SDR Tone Mapping
+
+```json
+{
+  "video": {
+    "fps": 60,
+    "preset": "p4",
+    "hdrToneMapping": {
+      "enabled": true,
+      "method": "reinhard",
+      "exposure": 0.5,
+      "gamma": 2.2,
+      "saturation": 1.1
+    }
+  }
+}
+```

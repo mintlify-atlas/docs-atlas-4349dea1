@@ -1,0 +1,539 @@
+---
+title: 'Input Data Channels'
+description: 'Keyboard and mouse input channels for real-time user interaction'
+---
+
+# Input Data Channels
+
+CloudGaming uses dedicated WebRTC data channels to transmit user input from the client to the host with minimal latency. Each input type uses an optimized channel configuration based on its reliability requirements.
+
+## Channel Configuration
+
+### keyPressChannel (Keyboard Input)
+
+The keyboard channel uses **ordered, reliable** delivery to ensure no key events are lost or received out of order.
+
+```javascript
+// Client: Create keyboard channel
+dataChannel = peerConnection.createDataChannel("keyPressChannel", { 
+  ordered: true  // Maintain event order
+});
+```
+
+**Source:** `Client/html-server/index.html:1369`
+
+**Why ordered and reliable?**
+- Key sequences must be preserved (e.g., Ctrl+C)
+- Missing key events cause stuck keys
+- Order matters for text input and shortcuts
+
+### mouseChannel (Mouse Input)
+
+The mouse channel uses **unordered, unreliable** delivery with no retransmissions for lowest possible latency.
+
+```javascript
+// Client: Create mouse channel with maxRetransmits=0
+mouseChannel = peerConnection.createDataChannel("mouseChannel", { 
+  ordered: false,       // Order not critical
+  maxRetransmits: 0     // Never retransmit lost packets
+});
+```
+
+**Source:** `Client/html-server/index.html:1370`
+
+**Why unordered and unreliable?**
+- Mouse movements are rapidly superseded by newer positions
+- Retransmitting old mouse positions causes lag
+- Missing one mouse event is imperceptible
+- Immediate delivery is more important than reliability
+
+## Message Schemas
+
+### Keyboard Events
+
+All keyboard messages include these fields:
+
+```typescript
+interface KeyboardMessage {
+  type: "keydown" | "keyup";     // Event type
+  code: string;                   // JavaScript KeyboardEvent.code
+  key: string;                    // JavaScript KeyboardEvent.key
+  client_send_time: number;       // Client timestamp (ms)
+}
+```
+
+**Schema Constants** (`Host/InputSchema.h:5-22`):
+```cpp
+namespace InputSchema {
+    static constexpr const char* kType = "type";
+    static constexpr const char* kCode = "code";
+    static constexpr const char* kClientSendTime = "client_send_time";
+    
+    // Event type values
+    static constexpr const char* kKeyDown = "keydown";
+    static constexpr const char* kKeyUp   = "keyup";
+}
+```
+
+#### Example: Keydown Event
+
+```json
+{
+  "type": "keydown",
+  "code": "KeyW",
+  "key": "w",
+  "client_send_time": 1709481234567
+}
+```
+
+**Client code** (`Client/html-server/index.html:1527`):
+```javascript
+function handleKeyDown(event) {
+  if (!event.code || event.repeat) return;
+  
+  event.preventDefault();
+  keyState.add(event.code);
+  const keyData = { 
+    key: event.key, 
+    code: event.code, 
+    type: 'keydown', 
+    client_send_time: Date.now() 
+  };
+  sendKeyPress(keyData);
+}
+```
+
+#### Example: Keyup Event
+
+```json
+{
+  "type": "keyup",
+  "code": "KeyW",
+  "key": "w",
+  "client_send_time": 1709481235678
+}
+```
+
+**Client code** (`Client/html-server/index.html:1536`):
+```javascript
+function handleKeyUp(event) {
+  if (!event.code) return;
+  if (!keyState.has(event.code)) return;
+  
+  event.preventDefault();
+  keyState.delete(event.code);
+  const keyData = { 
+    key: event.key, 
+    code: event.code, 
+    type: 'keyup', 
+    client_send_time: Date.now() 
+  };
+  sendKeyPress(keyData);
+}
+```
+
+### Mouse Events
+
+All mouse messages include these fields:
+
+```typescript
+interface MouseMessage {
+  type: "mousemove" | "mousedown" | "mouseup";
+  x: number;                      // X coordinate in canvas space
+  y: number;                      // Y coordinate in canvas space
+  button?: number;                // Button index (0=left, 1=middle, 2=right)
+  client_send_time: number;       // Client timestamp (ms)
+}
+```
+
+**Schema Constants** (`Host/InputSchema.h:11-21`):
+```cpp
+namespace InputSchema {
+    // Mouse fields
+    static constexpr const char* kX = "x";
+    static constexpr const char* kY = "y";
+    static constexpr const char* kButton = "button";
+    
+    // Event type values
+    static constexpr const char* kMouseMove = "mousemove";
+    static constexpr const char* kMouseDown = "mousedown";
+    static constexpr const char* kMouseUp   = "mouseup";
+}
+```
+
+#### Example: Mouse Move
+
+```json
+{
+  "type": "mousemove",
+  "x": 960,
+  "y": 540,
+  "client_send_time": 1709481234567
+}
+```
+
+**Client code with throttling** (`Client/html-server/index.html:1031-1046`):
+```javascript
+// Throttle mouse moves to ~125Hz (8ms) to reduce bandwidth
+const throttledSendMouseMove = throttle((event) => {
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  
+  const mouseData = {
+    type: "mousemove",
+    x: Math.round((event.clientX - rect.left) * scaleX),
+    y: Math.round((event.clientY - rect.top) * scaleY),
+    client_send_time: Date.now(),
+  };
+
+  sendMouseEvent(mouseData);
+  mousePosition.x = mouseData.x;
+  mousePosition.y = mouseData.y;
+}, 8);
+```
+
+#### Example: Mouse Button Events
+
+```json
+// Mouse down
+{
+  "type": "mousedown",
+  "x": 960,
+  "y": 540,
+  "button": 0,
+  "client_send_time": 1709481234567
+}
+
+// Mouse up
+{
+  "type": "mouseup",
+  "x": 960,
+  "y": 540,
+  "button": 0,
+  "client_send_time": 1709481235678
+}
+```
+
+**Client code** (`Client/html-server/index.html:1545-1578`):
+```javascript
+function handleMouseDown(event) {
+  event.preventDefault();
+  mouseButtonState.add(event.button);
+  
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  
+  const mouseData = {
+    type: 'mousedown',
+    x: Math.round((event.clientX - rect.left) * scaleX),
+    y: Math.round((event.clientY - rect.top) * scaleY),
+    button: event.button,
+    client_send_time: Date.now(),
+  };
+  sendMouseEvent(mouseData);
+}
+
+function handleMouseUp(event) {
+  event.preventDefault();
+  if (!mouseButtonState.has(event.button)) return;
+  mouseButtonState.delete(event.button);
+  
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  
+  const mouseData = {
+    type: 'mouseup',
+    x: Math.round((event.clientX - rect.left) * scaleX),
+    y: Math.round((event.clientY - rect.top) * scaleY),
+    button: event.button,
+    client_send_time: Date.now(),
+  };
+  sendMouseEvent(mouseData);
+}
+```
+
+## Host-Side Processing
+
+### Keyboard Processing
+
+The host receives keyboard events through a blocking queue for deterministic processing (`Host/KeyInputHandler.cpp:518-686`):
+
+```cpp
+void messagePollingLoop() {
+    while (isRunning.load() && !ShutdownManager::IsShutdown()) {
+        std::string message;
+        
+        // Blocking wait for message
+        {
+            std::unique_lock<std::mutex> lock(queueMutex);
+            queueCondition.wait(lock, [&]() {
+                return shutdownRequested || !keyboardMessageQueue.empty();
+            });
+            
+            if (!keyboardMessageQueue.empty()) {
+                message = keyboardMessageQueue.front();
+                keyboardMessageQueue.pop();
+            }
+        }
+        
+        // Parse and inject
+        json j = json::parse(message);
+        if (j.contains(InputSchema::kCode) && j.contains(InputSchema::kType)) {
+            std::string jsCode = j[InputSchema::kCode].get<std::string>();
+            std::string jsType = j[InputSchema::kType].get<std::string>();
+            bool isKeyDown = (jsType == "keydown");
+            
+            // Convert JavaScript key code to Windows virtual key
+            WORD vkCode = MapJavaScriptCodeToVK(jsCode);
+            
+            // Inject via SendInput API
+            SimulateWindowsKeyEvent(jsCode, isKeyDown);
+        }
+    }
+}
+```
+
+### Mouse Processing
+
+The mouse handler processes events with priority elevation for low latency (`Host/MouseInputHandler.cpp:440-716`):
+
+```cpp
+void mouseMessagePollingLoop() {
+    // Elevate thread priority for input injection
+    ThreadPriorityManager::ScopedPriorityElevation priorityElevation;
+    
+    while (isRunning.load() && !ShutdownManager::IsShutdown()) {
+        std::string message;
+        
+        // Blocking wait
+        {
+            std::unique_lock<std::mutex> lock(queueMutex);
+            queueCondition.wait(lock, [&]() {
+                return shutdownRequested || !mouseMessageQueue.empty();
+            });
+            
+            if (!mouseMessageQueue.empty()) {
+                message = mouseMessageQueue.front();
+                mouseMessageQueue.pop();
+            }
+        }
+        
+        // Parse and route
+        json j = json::parse(message);
+        std::string jsType = j[InputSchema::kType].get<std::string>();
+        
+        if (jsType == InputSchema::kMouseMove) {
+            int x = j[InputSchema::kX].get<int>();
+            int y = j[InputSchema::kY].get<int>();
+            simulateWindowsMouseEvent(jsType, x, y, -1);
+        }
+        else if (jsType == InputSchema::kMouseDown || jsType == InputSchema::kMouseUp) {
+            int x = j[InputSchema::kX].get<int>();
+            int y = j[InputSchema::kY].get<int>();
+            int button = j[InputSchema::kButton].get<int>();
+            simulateWindowsMouseEvent(jsType, x, y, button);
+        }
+    }
+}
+```
+
+## Input Injection
+
+### Windows SendInput API
+
+Both keyboard and mouse events are injected using the Windows `SendInput` API for system-level control (`Host/KeyInputHandler.cpp:407-516`, `Host/MouseInputHandler.cpp:204-438`):
+
+```cpp
+// Keyboard injection
+void SimulateWindowsKeyEvent(const std::string& eventCode, bool isKeyDown) {
+    INPUT input = { 0 };
+    input.type = INPUT_KEYBOARD;
+    
+    WORD virtualKeyCode = MapJavaScriptCodeToVK(eventCode);
+    WORD scanCode = MapJavaScriptCodeToScanCode(eventCode);
+    
+    input.ki.wScan = scanCode;
+    input.ki.dwFlags = KEYEVENTF_SCANCODE;
+    
+    if (IsExtendedKey(virtualKeyCode)) {
+        input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+    }
+    if (!isKeyDown) {
+        input.ki.dwFlags |= KEYEVENTF_KEYUP;
+    }
+    
+    SendInput(1, &input, sizeof(INPUT));
+}
+
+// Mouse injection with absolute positioning
+void simulateWindowsMouseEvent(const std::string& eventType, int x, int y, int button) {
+    INPUT input = { 0 };
+    input.type = INPUT_MOUSE;
+    
+    if (eventType == "mousemove") {
+        // Transform client coordinates to absolute virtual desktop coordinates
+        auto transformResult = MouseCoordinateTransform::globalTransformer
+            .transformClientToAbsolute(x, y, targetWindow, clientWidth, clientHeight);
+        
+        input.mi.dx = transformResult.absoluteX;
+        input.mi.dy = transformResult.absoluteY;
+        input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+    }
+    else if (eventType == "mousedown") {
+        input.mi.dwFlags = (button == 0) ? MOUSEEVENTF_LEFTDOWN : 
+                          (button == 1) ? MOUSEEVENTF_MIDDLEDOWN : 
+                          MOUSEEVENTF_RIGHTDOWN;
+    }
+    else if (eventType == "mouseup") {
+        input.mi.dwFlags = (button == 0) ? MOUSEEVENTF_LEFTUP : 
+                          (button == 1) ? MOUSEEVENTF_MIDDLEUP : 
+                          MOUSEEVENTF_RIGHTUP;
+    }
+    
+    SendInput(1, &input, sizeof(INPUT));
+}
+```
+
+## Performance Optimizations
+
+### Mouse Move Coalescing
+
+The host coalesces rapid mouse move events to reduce processing overhead (`Host/MouseInputHandler.cpp:27-75`):
+
+```cpp
+struct CoalescedMouseMove {
+    int x = -1;
+    int y = -1;
+    bool hasPendingMove = false;
+    std::chrono::steady_clock::time_point lastUpdateTime;
+    std::chrono::steady_clock::time_point windowStartTime;
+    
+    // 4ms coalescing window to prevent visible lag
+    static constexpr std::chrono::milliseconds COALESCE_WINDOW_MS{4};
+    static constexpr int MAX_COALESCED_EVENTS = 10;
+    int coalescedEventCount = 0;
+    
+    void update(int newX, int newY) {
+        auto now = std::chrono::steady_clock::now();
+        
+        // Start new window if expired or max events reached
+        if (!hasPendingMove ||
+            (now - windowStartTime) > COALESCE_WINDOW_MS ||
+            coalescedEventCount >= MAX_COALESCED_EVENTS) {
+            windowStartTime = now;
+            coalescedEventCount = 0;
+        }
+        
+        // Update with latest coordinates (supersedes previous)
+        x = newX;
+        y = newY;
+        hasPendingMove = true;
+        lastUpdateTime = now;
+        coalescedEventCount++;
+    }
+};
+```
+
+### Thread Priority Elevation
+
+The mouse processing thread runs at elevated priority to minimize input latency (`Host/MouseInputHandler.cpp:443-449`):
+
+```cpp
+void mouseMessagePollingLoop() {
+    // Elevate thread priority for input injection
+    ThreadPriorityManager::ScopedPriorityElevation priorityElevation;
+    if (!priorityElevation.isElevated()) {
+        std::cerr << "Failed to elevate thread priority" << std::endl;
+    }
+    // ... process messages
+}
+```
+
+## State Management
+
+### Key State Tracking
+
+Both client and host maintain key state to prevent duplicate events:
+
+**Client** (`Client/html-server/index.html:715-717`):
+```javascript
+const keyState = new Set();
+const mouseButtonState = new Set();
+const mousePosition = {x: 0, y: 0};
+```
+
+**Host** (`Host/KeyInputHandler.cpp:44-48`):
+```cpp
+static std::set<WORD> clientReportedKeysDown;
+static std::mutex clientKeysMutex;
+static std::unordered_map<WORD, std::string> vkDownToJsCode;
+static std::unordered_map<uint16_t, std::string> scanIdDownToJs;
+```
+
+### Cleanup on Disconnect
+
+When the connection closes, all held keys/buttons are automatically released (`Host/KeyInputHandler.cpp:689-714`, `Host/MouseInputHandler.cpp:695-716`):
+
+```cpp
+// Keyboard cleanup
+for (const auto& jsCodeToRelease : codesToRelease) {
+    LOG_INFO("Cleanup: Releasing '" + jsCodeToRelease + "'");
+    SimulateWindowsKeyEvent(jsCodeToRelease, false);
+}
+
+// Mouse cleanup  
+for (int buttonToRelease : buttonsToRelease) {
+    simulateWindowsMouseEvent("mouseup", cleanupX, cleanupY, buttonToRelease);
+}
+```
+
+## Best Practices
+
+### Client-Side
+
+1. **Always check channel state** before sending:
+   ```javascript
+   if (dataChannel && dataChannel.readyState === 'open' && 
+       dataChannel.bufferedAmount < 65536) {
+       dataChannel.send(message);
+   }
+   ```
+
+2. **Throttle mouse moves** to reasonable rate (8ms = 125Hz):
+   ```javascript
+   const throttledSendMouseMove = throttle(sendMouseMove, 8);
+   ```
+
+3. **Prevent default events** to avoid browser interference:
+   ```javascript
+   function handleKeyDown(event) {
+       event.preventDefault();
+       // ... send to host
+   }
+   ```
+
+4. **Track state locally** to filter duplicates:
+   ```javascript
+   if (!keyState.has(event.code)) {
+       keyState.add(event.code);
+       sendKeyPress(keyData);
+   }
+   ```
+
+### Host-Side
+
+1. **Use blocking queues** for deterministic event ordering
+2. **Validate all input** before injection
+3. **Clamp coordinates** to screen bounds
+4. **Release all input** on cleanup
+5. **Use scancode injection** for layout independence
+6. **Elevate thread priority** for time-sensitive input
+
+## Related Documentation
+
+- [Feedback Channels](/api/data-channels/feedback) - Video stats and latency measurement
+- [Configuration Reference](/configuration/input) - Input injection configuration options
+- [Performance Tuning](/operations/performance-tuning) - Optimizing input latency

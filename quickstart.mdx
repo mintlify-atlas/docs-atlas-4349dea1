@@ -1,80 +1,220 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: Quick Start
+description: Get CloudGaming up and running in minutes with this step-by-step guide
 ---
 
-## Get started in three steps
+This guide will walk you through setting up a complete CloudGaming environment on your local machine. You'll have a working streaming session in under 15 minutes.
 
-Get your documentation site running locally and make your first customization.
+## Prerequisites
 
-### Step 1: Set up your local environment
+Before you begin, ensure you have:
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
-
-### Step 2: Deploy your changes
-
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
-
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
-
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
-
-### Step 3: Go live
-
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
-
-## Next steps
-
-Now that you have your docs running, explore these key features:
-
-<CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
-</CardGroup>
+- **Windows 10/11** (build 1903+) with a GPU (NVIDIA, AMD, or Intel)
+- **Visual Studio 2022** with C++ desktop development workload
+- **Node.js 18+** and npm
+- **Redis** (download from [redis.io](https://redis.io/download))
+- **Git** for cloning the repository
 
 <Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
+This quickstart uses `localhost` for all components. For production deployment, see the [Deployment Guide](/deployment/overview).
 </Note>
+
+## Setup Steps
+
+<Steps>
+  <Step title="Install Redis">
+    Start Redis server on the default port (6379):
+    
+    ```bash
+    redis-server
+    ```
+    
+    Leave this terminal window open. Redis is required for signaling server coordination.
+  </Step>
+
+  <Step title="Start the Signaling Server">
+    Navigate to the Server directory and install dependencies:
+    
+    ```bash
+    cd Server
+    npm install
+    npm start
+    ```
+    
+    The signaling server will start on `ws://localhost:3002`. Keep this terminal open.
+    
+    <Tip>
+    For development with prettier logs, use `npm run dev` instead.
+    </Tip>
+  </Step>
+
+  <Step title="Start the Matchmaker Service">
+    In a new terminal, start the matchmaker:
+    
+    ```bash
+    cd Server
+    node mm_server/Matchmaker.js
+    ```
+    
+    The matchmaker will listen on `http://localhost:3000`. This service handles host registration and client matching.
+  </Step>
+
+  <Step title="Build and Run the Host">
+    Open `DisplayCaptureProject.sln` in Visual Studio 2022 and build the solution (x64, Debug or Release).
+    
+    Before running, ensure `config.json` is in the same directory as the executable. Use the default config or customize for your needs.
+    
+    Run the host:
+    ```bash
+    x64\Debug\DisplayCaptureProject.exe
+    ```
+    
+    The host will:
+    - Generate a unique Room ID (displayed in console)
+    - Register with the matchmaker
+    - Start capturing the target process (configured in `config.json`)
+    - Wait for client connections
+    
+    <Warning>
+    Make sure the `targetProcessName` in `config.json` matches a running process on your system.
+    </Warning>
+  </Step>
+
+  <Step title="Start the Client">
+    In a new terminal, serve the client HTML:
+    
+    ```bash
+    cd Client/html-server
+    npx http-server . -p 8080
+    ```
+    
+    Open your browser to `http://localhost:8080`
+  </Step>
+
+  <Step title="Connect and Stream">
+    In the browser client:
+    
+    1. Click **"Find Match"** to automatically discover the host
+    2. The client will connect via WebRTC signaling
+    3. Once connected, you'll see the host's screen streaming in real-time
+    4. Use keyboard and mouse to interact with the remote session
+    
+    <Info>
+    Alternatively, you can manually enter the Room ID displayed by the host console.
+    </Info>
+  </Step>
+</Steps>
+
+## Verify the Connection
+
+Once connected, you should see:
+
+- **Client Browser**: Live video stream with low latency (under 50ms typical)
+- **Host Console**: Connection status and performance metrics
+- **Performance Overlay**: FPS, latency, and bitrate indicators in the client
+
+## Configuration
+
+The default `config.json` provides sensible defaults for local testing. Key settings to adjust:
+
+### Target Process
+
+```json
+{
+  "host": {
+    "targetProcessName": "notepad.exe"
+  }
+}
+```
+
+Change this to the process you want to capture (e.g., a game executable).
+
+### Video Quality
+
+```json
+{
+  "host": {
+    "video": {
+      "fps": 60,
+      "bitrateStart": 8000000,
+      "preset": "p2"
+    }
+  }
+}
+```
+
+- Lower `preset` (p1-p7) = faster encoding, higher latency
+- Higher `bitrateStart` = better quality, more bandwidth
+
+### Audio
+
+```json
+{
+  "host": {
+    "audio": {
+      "processLoopback": {
+        "enabled": true
+      }
+    }
+  }
+}
+```
+
+Enable `processLoopback` to capture only the target process audio (Windows 11+).
+
+## Troubleshooting
+
+<Accordion title="Client can't find host">
+  **Possible causes:**
+  - Matchmaker not running on port 3000
+  - Host hasn't sent heartbeat to matchmaker
+  - Host status is "busy" instead of "idle"
+  
+  **Solution:** Check that all services are running and the host console shows successful registration.
+</Accordion>
+
+<Accordion title="WebRTC connection fails">
+  **Possible causes:**
+  - Signaling server not running on port 3002
+  - Redis not running on port 6379
+  - Firewall blocking WebSocket connections
+  
+  **Solution:** Verify all services are running and check browser console for errors.
+</Accordion>
+
+<Accordion title="No video or audio">
+  **Possible causes:**
+  - Target process not running
+  - GPU encoder not available
+  - Audio device not configured
+  
+  **Solution:** Check host console for encoder initialization errors. Ensure target process is running.
+</Accordion>
+
+<Accordion title="High latency or stuttering">
+  **Possible causes:**
+  - CPU/GPU overload
+  - Network bandwidth insufficient
+  - Incorrect encoder preset
+  
+  **Solution:** Lower FPS, reduce bitrate, or use a faster NVENC preset (p1 or p2). See [Performance Tuning](/operations/performance-tuning).
+</Accordion>
+
+## Next Steps
+
+Now that you have a working setup:
+
+<CardGroup cols={2}>
+  <Card title="Architecture" icon="sitemap" href="/architecture">
+    Understand how components work together
+  </Card>
+  <Card title="Configuration" icon="gear" href="/configuration/overview">
+    Explore advanced configuration options
+  </Card>
+  <Card title="Deployment" icon="rocket" href="/deployment/overview">
+    Deploy to production with Railway, Docker, or Kubernetes
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/matchmaking/overview">
+    Learn about the Matchmaking and Signaling APIs
+  </Card>
+</CardGroup>

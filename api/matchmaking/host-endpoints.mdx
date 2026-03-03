@@ -1,0 +1,165 @@
+---
+title: Host Endpoints
+description: API endpoints for host registration and status management
+---
+
+These endpoints are used by the C++ Host application to register with the matchmaking service and update availability status.
+
+## Heartbeat
+
+<Tip>
+Send heartbeat requests every 20-25 seconds to keep your host registered and available.
+</Tip>
+
+Registers a new host or refreshes an existing host's TTL. This endpoint serves dual purposes:
+- **Initial Registration**: When a host first starts, it sends its details to become available for matchmaking
+- **Keep-Alive**: Ongoing heartbeats refresh the 30-second TTL to prevent expiration
+
+```bash
+POST /api/host/heartbeat
+```
+
+### Request Body
+
+<ParamField body="hostId" type="string" required>
+  Unique identifier for this host session. Generate a UUID when the host application starts.
+  
+  Example: `"550e8400-e29b-41d4-a716-446655440000"`
+</ParamField>
+
+<ParamField body="roomId" type="string" required>
+  Room identifier used for WebRTC signaling. This is passed to clients for peer connection establishment.
+  
+  Example: `"room-abc123xyz"`
+</ParamField>
+
+<ParamField body="region" type="string" default="config default">
+  Geographic region code for this host. Used for client-side region filtering.
+  
+  Supported values: `us-east-1`, `us-west-1`, `eu-central`, `local`
+</ParamField>
+
+<ParamField body="status" type="string" default="idle">
+  Current availability status of the host.
+  
+  - `idle` - Ready to accept new connections
+  - `busy` - Currently in an active session
+  
+  Defaults to `idle` for new registrations.
+</ParamField>
+
+### Request Example
+
+```bash
+curl -X POST https://api.yourdomain.com/api/host/heartbeat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "hostId": "550e8400-e29b-41d4-a716-446655440000",
+    "roomId": "room-abc123xyz",
+    "region": "us-east-1",
+    "status": "idle"
+  }'
+```
+
+### Response
+
+<ResponseField name="success" type="boolean">
+  Indicates whether the heartbeat was successfully processed.
+</ResponseField>
+
+<ResponseField name="ttl" type="number">
+  Time-to-live in seconds before the host entry expires. Always returns `30`.
+</ResponseField>
+
+### Response Example
+
+```json
+{
+  "success": true,
+  "ttl": 30
+}
+```
+
+### Implementation Notes
+
+- Send heartbeats every 20-25 seconds to maintain a safety buffer before the 30-second TTL expires
+- If the host crashes or loses connectivity, the Redis entry automatically expires
+- The same endpoint handles both initial registration and subsequent heartbeats
+- Store your `hostId` and `roomId` in memory - they should remain constant for the host's lifetime
+
+---
+
+## Update Status
+
+<Info>
+Call this endpoint immediately when a client connects to mark yourself as busy.
+</Info>
+
+Updates the host's availability status. Typically called when:
+- A peer successfully connects via WebRTC signaling (set to `busy`)
+- A session ends and the host becomes available again (set to `idle`)
+
+```bash
+POST /api/host/status
+```
+
+### Request Body
+
+<ParamField body="hostId" type="string" required>
+  The unique identifier for your host session. Must match the `hostId` used in heartbeat requests.
+  
+  Example: `"550e8400-e29b-41d4-a716-446655440000"`
+</ParamField>
+
+<ParamField body="status" type="string" required>
+  The new status for this host.
+  
+  - `idle` - Host is available for new matches
+  - `busy` - Host is currently serving a client
+</ParamField>
+
+### Request Example
+
+```bash
+curl -X POST https://api.yourdomain.com/api/host/status \
+  -H "Content-Type: application/json" \
+  -d '{
+    "hostId": "550e8400-e29b-41d4-a716-446655440000",
+    "status": "busy"
+  }'
+```
+
+### Response
+
+<ResponseField name="success" type="boolean">
+  Indicates whether the status update was successful.
+</ResponseField>
+
+### Response Example
+
+```json
+{
+  "success": true
+}
+```
+
+### Typical Flow
+
+1. **Host starts**: Send heartbeat with `status: "idle"`
+2. **Client connects**: Call `/api/host/status` with `status: "busy"`
+3. **Continue heartbeats**: Keep sending heartbeats (status persists)
+4. **Session ends**: Call `/api/host/status` with `status: "idle"`
+5. **Host shuts down**: Stop sending heartbeats (entry expires automatically)
+
+### Error Handling
+
+<Warning>
+If the host's Redis entry has expired (no heartbeat for 30+ seconds), status updates will fail silently. Always ensure heartbeats are running before updating status.
+</Warning>
+
+```json
+{
+  "success": false,
+  "error": "Host not found"
+}
+```

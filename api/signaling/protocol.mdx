@@ -1,0 +1,400 @@
+---
+title: 'WebSocket Signaling Protocol'
+description: 'WebSocket-based signaling protocol for WebRTC connection establishment'
+---
+
+## Overview
+
+The CloudGaming signaling server uses WebSocket connections to coordinate WebRTC peer connections between hosts and clients. The server implements a scalable, room-based architecture with Redis pub/sub for multi-node deployments.
+
+## Connection URL
+
+Clients connect to the signaling server using a WebSocket URL with a required `roomId` query parameter:
+
+```
+ws://localhost:3002?roomId=ROOM_ID
+```
+
+For production deployments using WSS:
+
+```
+wss://your-signaling-server.com?roomId=ROOM_ID
+```
+
+### Connection Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `roomId` | string | Yes | Unique room identifier (alphanumeric, `_`, `-`, `:`, `.`) |
+| `token` | string | No | JWT authentication token (if auth enabled) |
+
+### Room ID Validation
+
+Room IDs must meet the following criteria:
+
+- **Pattern**: `/^[A-Za-z0-9_\-:.]+$/`
+- **Length**: 1 to `roomIdMaxLength` characters (default: 128)
+- **Type**: String
+
+**Example valid room IDs:**
+```
+game-session-123
+room:user456
+host_abc-def.123
+```
+
+## Connection Lifecycle
+
+### 1. WebSocket Handshake
+
+When a client connects, the server performs the following checks:
+
+1. **Circuit breaker check** - Rejects connections if Redis is unavailable
+2. **Room ID validation** - Verifies format and length
+3. **Origin validation** - Checks against allowed origins (if configured)
+4. **Subprotocol validation** - Verifies required subprotocol (if configured)
+5. **JWT authentication** - Validates token and room access (if enabled)
+6. **Rate limiting** - Enforces connection rate limits per IP
+7. **Room capacity** - Ensures room is not full
+
+**Successful connection:**
+```javascript
+// Server assigns unique client ID
+clientId: "client:uuid"
+
+// Client added to room's Redis set
+SADD room:ROOM_ID clientId
+
+// Client subscribed to room channel
+PSUBSCRIBE room:*
+```
+
+### 2. Active Connection
+
+During an active connection:
+
+- **Heartbeat**: Server sends WebSocket ping frames every `heartbeatIntervalMs` (default: 30s)
+- **Pong response**: Client must respond with pong frames to maintain connection
+- **Message forwarding**: All messages are forwarded to other peers in the same room
+- **Local fanout**: Messages are delivered to local clients immediately for low latency
+- **Redis pub/sub**: Messages are published to Redis for cross-instance delivery
+
+### 3. Disconnection
+
+When a client disconnects:
+
+1. Client removed from local room map
+2. Client removed from Redis room set: `SREM room:ROOM_ID clientId`
+3. Expiry set on room: `EXPIRE room:ROOM_ID roomTtlSeconds`
+4. `peer-disconnected` message broadcast to remaining peers
+5. Heartbeat interval cleared
+
+## Room-Based Routing
+
+The server organizes connections into rooms, each identified by a unique `roomId`.
+
+### Room Structure
+
+**Local in-memory map:**
+```javascript
+localRooms = Map<roomId, Set<WebSocket>>
+```
+
+**Redis distributed set:**
+```
+KEY: room:ROOM_ID
+VALUE: Set of client IDs
+TTL: roomTtlSeconds (default: 3600s)
+```
+
+### Message Flow
+
+```
+Client A → WebSocket → Server Instance 1 → {
+  1. Local fanout to peers on Instance 1
+  2. Redis PUBLISH to room:ROOM_ID
+} → Redis → Server Instance 2 → Local fanout to peers on Instance 2
+```
+
+### Room Capacity
+
+Rooms have a configurable maximum capacity (default: 100 clients). When a room is full, new connections receive:
+
+```
+WebSocket close code: 1000
+Reason: "Room is full"
+```
+
+## Redis Pub/Sub for Multi-Node Scaling
+
+The signaling server uses Redis pub/sub to enable horizontal scaling across multiple server instances.
+
+### Redis Channels
+
+Each room has a dedicated pub/sub channel:
+
+```
+Channel pattern: room:*
+Specific channel: room:ROOM_ID
+```
+
+### Published Message Format
+
+```json
+{
+  "senderId": "client:uuid",
+  "data": { /* original signaling message */ },
+  "originServerId": "srv:timestamp:random"
+}
+```
+
+### Subscriber Behavior
+
+1. Server subscribes to `room:*` pattern on startup
+2. On receiving a message:
+   - Parses JSON payload
+   - Filters out messages from same server instance (via `originServerId`)
+   - Forwards `data` to all local clients in the room (except sender)
+
+### Atomic Room Operations
+
+The server uses Lua scripts for atomic Redis operations:
+
+**Join operation:**
+```lua
+SCARD room:ROOM_ID        -- Check current size
+if size < capacity then
+  SADD room:ROOM_ID clientId
+  EXPIRE room:ROOM_ID ttl
+  return 0
+else
+  return -1               -- Room full
+end
+```
+
+**Leave operation:**
+```lua
+SREM room:ROOM_ID clientId
+if SCARD room:ROOM_ID == 0 then
+  DEL room:ROOM_ID
+else
+  EXPIRE room:ROOM_ID ttl
+end
+```
+
+## Circuit Breaker
+
+The server implements a circuit breaker pattern to handle Redis failures gracefully.
+
+### Circuit States
+
+**Closed (Normal):**
+- Redis operations succeed
+- Connections accepted
+- Messages forwarded
+
+**Open (Failure):**
+- Redis operations fail `cbErrorThreshold` times (default: 3)
+- Circuit opens for `cbOpenMs` milliseconds (default: 30000)
+- New connections rejected with code 1013 ("Service unavailable")
+- Existing connections continue with local-only forwarding
+
+**Half-Open (Recovery):**
+- After `cbOpenMs`, circuit allows test operations
+- Successful operation closes circuit
+- Failed operation re-opens circuit
+
+## Rate Limiting
+
+Multiple rate limits protect the server from abuse:
+
+### Connection Rate Limit
+
+- **Namespace**: `conn`
+- **Key**: Client IP address
+- **Limit**: `rateLimitConnPer10s` connections per 10 seconds (default: 5)
+- **Action**: Close with code 1013 ("Rate limited")
+
+### Message Rate Limits
+
+**Per-client token bucket:**
+- **Limit**: `rateLimitMessagesPer10s` messages per 10 seconds (default: 100)
+- **Refill**: Continuous token bucket algorithm
+- **Action**: Drop message silently
+
+**Per-IP message rate:**
+- **Namespace**: `msg-ip`
+- **Key**: Client IP address
+- **Limit**: `rateLimitIpMsgsPer10s` per 10 seconds (default: 500)
+
+**Per-room message rate:**
+- **Namespace**: `msg-room`
+- **Key**: Room ID
+- **Limit**: `rateLimitRoomMsgsPer10s` per 10 seconds (default: 1000)
+
+## Backpressure Management
+
+The server monitors `WebSocket.bufferedAmount` to prevent memory exhaustion:
+
+```javascript
+if (client.bufferedAmount > backpressureCloseThresholdBytes) {
+  client.close(1013, 'Server overloaded');
+}
+```
+
+**Default threshold**: 1MB (configurable)
+
+## Health and Metrics Endpoints
+
+The server exposes HTTP endpoints on the same port as WebSocket:
+
+### `/healthz`
+
+Basic health check:
+
+```
+GET /healthz
+Response: 200 OK
+Body: "ok"
+```
+
+### `/readyz`
+
+Readiness check with Redis ping:
+
+```
+GET /readyz
+
+Success:
+  200 OK
+  Body: "ready"
+
+Failure:
+  503 Service Unavailable
+  Body: "not-ready"
+```
+
+### `/metrics`
+
+Prometheus-compatible metrics:
+
+```
+GET /metrics
+Response: text/plain
+
+Metrics:
+- signaling_active_connections
+- signaling_local_rooms
+- signaling_messages_forwarded_total
+- signaling_schema_rejects_total
+- signaling_rate_limit_drops_total
+- signaling_backpressure_closes_total
+- signaling_redis_operation_duration_seconds
+- signaling_fanout_duration_seconds
+- signaling_redis_up
+- signaling_circuit_breaker_open
+```
+
+## Graceful Shutdown
+
+On receiving SIGTERM or SIGINT:
+
+1. Enter drain mode (reject new connections)
+2. Close WebSocket server
+3. Send close frames to all clients with code 1001 ("Going away")
+4. Clean up Redis room membership
+5. Publish `peer-disconnected` messages
+6. Wait up to `drainTimeoutMs` for graceful close
+7. Disconnect from Redis
+8. Exit process
+
+## Error Handling
+
+### Connection Errors
+
+| Code | Reason | Description |
+|------|--------|-------------|
+| 1008 | Policy Violation | Invalid roomId, missing auth, origin not allowed |
+| 1011 | Internal Error | Redis failure during connection |
+| 1013 | Service Unavailable | Circuit breaker open, rate limited, backpressure |
+| 1000 | Normal Closure | Room full |
+
+### Message Validation Errors
+
+Invalid messages trigger a control error response:
+
+```json
+{
+  "type": "control",
+  "action": "schema-error"
+}
+```
+
+The invalid message is dropped and not forwarded.
+
+## Security Features
+
+### JWT Authentication
+
+When `enableAuth` is configured:
+
+```javascript
+// Token in query parameter
+ws://server?roomId=XXX&token=JWT_TOKEN
+
+// Token in Authorization header
+Authorization: Bearer JWT_TOKEN
+```
+
+**Token validation:**
+- Verify signature (JWKS or shared secret)
+- Check issuer and audience
+- Validate room claim: `payload[roomsClaim]`
+- Ensure user authorized for requested room
+
+### Origin Validation
+
+Configurable allowed origins:
+
+```javascript
+config.allowedOrigins = [
+  'https://example.com',
+  'https://app.example.com'
+]
+```
+
+Connections from unlisted origins are rejected.
+
+### Message Size Limits
+
+Maximum message size enforced:
+
+```javascript
+config.messageMaxBytes = 65536 // 64KB default
+```
+
+Oversized messages are dropped silently.
+
+## Configuration Reference
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `wsPort` | 3002 | WebSocket server port |
+| `redisUrl` | localhost:6379 | Redis connection URL |
+| `roomIdMaxLength` | 128 | Maximum room ID length |
+| `roomCapacity` | 100 | Maximum clients per room |
+| `roomTtlSeconds` | 3600 | Room expiry in Redis |
+| `heartbeatIntervalMs` | 30000 | Ping interval |
+| `messageMaxBytes` | 65536 | Maximum message size |
+| `backpressureCloseThresholdBytes` | 1048576 | Buffered amount threshold |
+| `rateLimitConnPer10s` | 5 | Connection rate per IP |
+| `rateLimitMessagesPer10s` | 100 | Message rate per client |
+| `rateLimitIpMsgsPer10s` | 500 | Message rate per IP |
+| `rateLimitRoomMsgsPer10s` | 1000 | Message rate per room |
+| `cbErrorThreshold` | 3 | Circuit breaker error count |
+| `cbOpenMs` | 30000 | Circuit breaker open duration |
+| `drainTimeoutMs` | 5000 | Graceful shutdown timeout |
+| `requireWss` | false | Enforce WSS in production |
+| `enableAuth` | false | Enable JWT authentication |
+| `allowedOrigins` | [] | Allowed origin domains |
+| `subprotocol` | null | Required WebSocket subprotocol |

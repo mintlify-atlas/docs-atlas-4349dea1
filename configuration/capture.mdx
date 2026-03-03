@@ -1,0 +1,337 @@
+---
+title: Screen Capture Configuration
+description: Configure Windows Graphics Capture (WGC), copy pools, frame queuing, and MMCSS settings
+---
+
+## Overview
+
+The `host.capture` section configures Windows Graphics Capture (WGC) for screen capture, including GPU texture copying, frame queuing, adaptive backoff, and thread priority optimization.
+
+## Texture Copy Pool
+
+GPU texture copy operations require pre-allocated D3D11 resources.
+
+<ParamField path="capture.copyPoolSize" type="integer" default="4">
+  Number of D3D11 texture copy resources in the pool.
+  
+  **Default:** `4`
+  
+  Higher values allow more parallel copy operations but use more GPU memory.
+  
+  **Recommended:**
+  - `4` - Standard (default)
+  - `6-8` - High frame rate (120+ FPS)
+  - `2-3` - Memory constrained systems
+  
+  <Tip>Increase this if you see frame drops at high frame rates.</Tip>
+</ParamField>
+
+<ParamField path="capture.framePoolBuffers" type="integer" default="2">
+  Number of frame buffers for WGC capture.
+  
+  **Default:** `2`
+  
+  Minimum of 2 required for double-buffering. Higher values add latency.
+</ParamField>
+
+## Frame Queue Management
+
+<ParamField path="capture.maxQueueDepth" type="integer" default="2">
+  Maximum frames queued for encoding.
+  
+  **Default:** `2`
+  
+  Lower values reduce latency but may cause frame drops if encoder is slow.
+  
+  **Recommended:**
+  - `1` - Absolute minimum latency (may drop frames)
+  - `2` - Low latency (default)
+  - `3-4` - More stable, slightly higher latency
+  
+  <Warning>Values above 3 significantly increase latency. Only use for debugging.</Warning>
+</ParamField>
+
+<ParamField path="capture.dropWindowMs" type="integer" default="500">
+  Time window in milliseconds for frame drop detection.
+  
+  **Default:** `500` ms
+  
+  Used to detect sustained frame dropping vs. occasional drops.
+</ParamField>
+
+<ParamField path="capture.dropMinEvents" type="integer" default="12">
+  Minimum frame drops within window to trigger warnings.
+  
+  **Default:** `12`
+  
+  Prevents spurious warnings from occasional frame drops.
+</ParamField>
+
+## Cursor and Border
+
+<ParamField path="capture.cursor" type="boolean" default="false">
+  Render cursor into captured frames.
+  
+  **Default:** `false`
+  
+  When disabled, the client renders its own cursor for lower latency.
+  
+  <Tip>Keep disabled for better cursor responsiveness. Enable only if client-side cursor has issues.</Tip>
+</ParamField>
+
+<ParamField path="capture.borderRequired" type="boolean" default="false">
+  Require window border for capture.
+  
+  **Default:** `false`
+  
+  When enabled, WGC only captures windows with borders (excludes fullscreen exclusive).
+</ParamField>
+
+## Frame Change Detection
+
+<ParamField path="capture.skipUnchanged" type="boolean" default="true">
+  Skip encoding frames identical to previous frame.
+  
+  **Default:** `true`
+  
+  Saves bandwidth and GPU cycles when screen content is static.
+  
+  <Tip>Keep enabled unless you need constant frame output for testing.</Tip>
+</ParamField>
+
+<ParamField path="capture.minUpdateInterval100ns" type="integer" default="166666">
+  Minimum frame capture interval in 100-nanosecond units.
+  
+  **Default:** `166666` (16.67 ms = 60 FPS)
+  
+  Controls the maximum capture rate. For 60 FPS: `1000000 / 60 * 10 = 166666`
+  
+  **Common values:**
+  - `83333` - 120 FPS
+  - `166666` - 60 FPS (default)
+  - `333333` - 30 FPS
+</ParamField>
+
+## Adaptive Backoff
+
+Dynamically reduce capture rate when encoder falls behind.
+
+<ParamField path="capture.adaptiveBackoff" type="boolean" default="false">
+  Enable adaptive capture rate backoff.
+  
+  **Default:** `false`
+  
+  When enabled, automatically reduces capture rate if encoder cannot keep up.
+  
+  <Warning>This adds complexity and may cause stuttering. Only enable if experiencing consistent encoder saturation.</Warning>
+</ParamField>
+
+<ParamField path="capture.adaptiveWindowMs" type="integer" default="2000">
+  Time window for adaptive backoff measurements.
+  
+  **Default:** `2000` ms
+  
+  Longer windows provide more stable adaptation but slower response.
+</ParamField>
+
+<ParamField path="capture.adaptiveEagainThreshold" type="integer" default="8">
+  Number of EAGAIN (encoder busy) errors to trigger backoff.
+  
+  **Default:** `8`
+  
+  Higher values tolerate more encoder saturation before reducing capture rate.
+</ParamField>
+
+## Thread Priority (MMCSS)
+
+Multimedia Class Scheduler Service (MMCSS) provides real-time thread priority for capture.
+
+<ParamField path="capture.mmcss.enable" type="boolean" default="true">
+  Enable MMCSS for capture thread.
+  
+  **Default:** `true`
+  
+  Boosts capture thread priority to reduce jitter and frame timing variance.
+  
+  <Tip>Keep enabled for consistent frame timing and lowest latency.</Tip>
+</ParamField>
+
+<ParamField path="capture.mmcss.priority" type="integer" default="4">
+  MMCSS task priority level.
+  
+  **Default:** `4`
+  
+  **Range:** `1` (lowest) to `8` (highest)
+  
+  Higher values give more CPU priority but may impact other system tasks.
+  
+  **Recommended:**
+  - `3-4` - Standard priority (default)
+  - `5-6` - High priority (gaming)
+  - `7-8` - Maximum priority (use with caution)
+</ParamField>
+
+## Windows Graphics Capture (WGC)
+
+WGC is the modern Windows 10+ screen capture API. Configuration is primarily done through the parameters above.
+
+### How WGC Works
+
+1. **Capture**: WGC provides GPU texture from compositor
+2. **Copy**: Texture copied to staging resource from `copyPoolSize` pool
+3. **Queue**: Frame queued for encoding (up to `maxQueueDepth`)
+4. **Encode**: FFmpeg/NVENC encodes the frame
+5. **Stream**: Encoded frame sent over WebRTC
+
+### WGC Requirements
+
+- Windows 10 version 1903 or later
+- DirectX 11 compatible GPU
+- Target window must be visible (minimized windows cannot be captured)
+
+<Warning>WGC cannot capture UAC prompts, secure desktop, or some protected content (DRM).</Warning>
+
+## Performance Optimization
+
+### Low Latency Configuration
+
+Minimize every source of latency:
+
+```json
+{
+  "capture": {
+    "copyPoolSize": 3,
+    "maxQueueDepth": 1,
+    "framePoolBuffers": 2,
+    "cursor": false,
+    "skipUnchanged": true,
+    "minUpdateInterval100ns": 83333,
+    "adaptiveBackoff": false,
+    "mmcss": {
+      "enable": true,
+      "priority": 6
+    }
+  }
+}
+```
+
+<Tip>
+  Setting `maxQueueDepth` to `1` provides minimum latency but may drop frames if encoding cannot maintain target frame rate.
+</Tip>
+
+### High Frame Rate Configuration
+
+For 120+ FPS capture:
+
+```json
+{
+  "capture": {
+    "copyPoolSize": 8,
+    "maxQueueDepth": 2,
+    "framePoolBuffers": 3,
+    "cursor": false,
+    "skipUnchanged": true,
+    "minUpdateInterval100ns": 83333,
+    "mmcss": {
+      "enable": true,
+      "priority": 7
+    }
+  }
+}
+```
+
+### Stable Configuration
+
+For consistent performance with minimal frame drops:
+
+```json
+{
+  "capture": {
+    "copyPoolSize": 6,
+    "maxQueueDepth": 3,
+    "framePoolBuffers": 2,
+    "cursor": false,
+    "skipUnchanged": true,
+    "adaptiveBackoff": true,
+    "adaptiveWindowMs": 1000,
+    "mmcss": {
+      "enable": true,
+      "priority": 4
+    }
+  }
+}
+```
+
+## Troubleshooting
+
+### Frame Drops
+
+**Symptoms:** Frequent frame drops, stuttering
+
+**Solutions:**
+1. Increase `copyPoolSize` to 6-8
+2. Increase `maxQueueDepth` to 3-4
+3. Enable `adaptiveBackoff`
+4. Reduce target `fps` in video configuration
+5. Use faster NVENC preset (`p1` or `p2`)
+
+### High Latency
+
+**Symptoms:** Delayed response to inputs
+
+**Solutions:**
+1. Reduce `maxQueueDepth` to 1-2
+2. Disable `adaptiveBackoff`
+3. Set `cursor` to `false`
+4. Ensure `mmcss.enable` is `true`
+5. Increase `mmcss.priority` to 6-7
+
+### GPU Memory Issues
+
+**Symptoms:** Crashes, D3D11 errors
+
+**Solutions:**
+1. Reduce `copyPoolSize` to 2-3
+2. Reduce `framePoolBuffers` to 2
+3. Lower capture resolution
+4. Check GPU memory usage with Task Manager
+
+### CPU Usage
+
+**Symptoms:** High CPU usage in capture thread
+
+**Solutions:**
+1. Enable `skipUnchanged`
+2. Use hardware encoding (NVENC/QSV/AMF)
+3. Increase `minUpdateInterval100ns` to reduce frame rate
+4. Disable `gpuTiming` if enabled
+
+## Example: Gaming Streaming Profile
+
+```json
+{
+  "capture": {
+    "copyPoolSize": 6,
+    "maxQueueDepth": 2,
+    "framePoolBuffers": 2,
+    "dropWindowMs": 500,
+    "dropMinEvents": 12,
+    "mmcss": {
+      "enable": true,
+      "priority": 6
+    },
+    "cursor": false,
+    "borderRequired": false,
+    "minUpdateInterval100ns": 83333,
+    "skipUnchanged": true,
+    "adaptiveBackoff": false
+  }
+}
+```
+
+This configuration provides:
+- 120 FPS capture capability
+- Low latency (2 frame queue depth)
+- High thread priority
+- Efficient bandwidth usage (skip unchanged frames)
+- Sufficient copy pool for smooth operation

@@ -1,0 +1,115 @@
+---
+title: Matchmaking API Overview
+description: Automatic matchmaking service for connecting clients to available gaming hosts
+---
+
+## Introduction
+
+The Matchmaking API connects Clients (Gamers) to available Hosts (Gaming PCs) by tracking host availability in Redis. The service automatically manages host lifecycle and enables seamless peer-to-peer connections through WebRTC signaling.
+
+## Base URL
+
+```
+https://api.yourdomain.com
+```
+
+For development:
+```
+http://localhost:3000
+```
+
+## Authentication
+
+Currently, the Matchmaking API does not require authentication. All endpoints are publicly accessible.
+
+## Data Model
+
+The service uses Redis to track active hosts with automatic expiration.
+
+### Active Hosts
+
+Hosts are stored as individual keys with a TTL (Time To Live). If a host crashes or loses internet connectivity, it automatically disappears from the available pool.
+
+**Redis Key Pattern:** `host:{hostId}`
+
+**TTL:** 30 seconds (refreshed by heartbeat)
+
+**Data Structure:**
+
+```json
+{
+  "hostId": "uuid-string-unique-per-session",
+  "roomId": "room-id-for-signaling",
+  "status": "idle",
+  "region": "us-east-1",
+  "lastHeartbeat": 1715620000000,
+  "publicIp": "1.2.3.4",
+  "gameInfo": {
+    "name": "Desktop Session",
+    "specs": "Generic Host"
+  }
+}
+```
+
+### Status Values
+
+- `idle` - Host is ready to accept new connections
+- `busy` - Host is currently in an active session
+
+### Regions
+
+Supported region codes:
+- `us-east-1` - US East
+- `us-west-1` - US West
+- `eu-central` - Europe Central
+- `local` - Local/Development
+
+## Common Response Codes
+
+<ResponseField name="200" type="OK">
+  Request successful. Response body contains requested data.
+</ResponseField>
+
+<ResponseField name="404" type="Not Found">
+  Resource not found. For matchmaking, this indicates no available hosts.
+</ResponseField>
+
+<ResponseField name="400" type="Bad Request">
+  Invalid request body or missing required parameters.
+</ResponseField>
+
+<ResponseField name="500" type="Internal Server Error">
+  Server error occurred while processing the request.
+</ResponseField>
+
+## API Endpoints
+
+The API is organized into two main categories:
+
+### Host Endpoints
+
+Used by the C++ Host application to register and update status:
+- [POST /api/host/heartbeat](/api/matchmaking/host-endpoints) - Register or refresh host availability
+- [POST /api/host/status](/api/matchmaking/host-endpoints) - Update host status
+
+### Client Endpoints
+
+Used by Web/Electron clients to find available hosts:
+- [POST /api/match/find](/api/matchmaking/client-endpoints) - Find available host for matchmaking
+
+## Matchmaking Logic
+
+The service uses a simple but effective algorithm:
+
+1. Receive matchmaking request from client
+2. Scan Redis for all keys matching `host:*`
+3. Filter hosts where `status === 'idle'`
+4. Apply optional region filter
+5. Select a random available host
+6. Mark host as allocated (prevents race conditions)
+7. Generate TURN credentials for WebRTC
+8. Return connection details to client
+
+## Automatic Cleanup
+
+Redis TTL automatically handles cleanup of inactive hosts. If a host fails to send a heartbeat within 30 seconds, its entry expires and becomes unavailable for matchmaking.

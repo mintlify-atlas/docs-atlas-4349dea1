@@ -1,0 +1,523 @@
+---
+title: 'Performance Tuning'
+description: 'Optimize CloudGaming for low latency and high quality'
+---
+
+## Overview
+
+This guide covers performance optimization across video encoding, audio processing, capture pipeline, and network configuration. All settings reference actual configuration from `config.json`.
+
+## Video Encoding Optimization
+
+### Bitrate Configuration
+
+Balance quality and latency with bitrate settings:
+
+```json
+{
+  "video": {
+    "bitrateStart": 8000000,  // 8 Mbps - initial bitrate
+    "bitrateMin": 8000000,    // 8 Mbps - minimum allowed
+    "bitrateMax": 12000000    // 12 Mbps - maximum allowed
+  }
+}
+```
+
+**Tuning Guidelines:**
+
+| Resolution | Min Bitrate | Recommended | Max Bitrate | Notes |
+|------------|-------------|-------------|-------------|-------|
+| 1080p@60fps | 6 Mbps | 8-10 Mbps | 12 Mbps | Default config |
+| 1080p@120fps | 10 Mbps | 12-15 Mbps | 20 Mbps | High motion |
+| 1440p@60fps | 10 Mbps | 12-16 Mbps | 20 Mbps | Higher resolution |
+| 4K@60fps | 20 Mbps | 25-35 Mbps | 50 Mbps | Requires tier expansion |
+
+**Network Conditions:**
+- **Excellent (< 20ms, < 1% loss)**: Use `bitrateMax`
+- **Good (20-50ms, 1-2% loss)**: Use `bitrateStart`  
+- **Fair (50-100ms, 2-5% loss)**: Reduce to `bitrateMin`
+- **Poor (>100ms, >5% loss)**: Consider reducing `bitrateMin`
+
+### Encoder Presets
+
+NVENC preset affects encoding speed and quality:
+
+```json
+{
+  "video": {
+    "preset": "p2",  // p1 (fastest) to p7 (slowest)
+    "rc": "cbr"      // Rate control: cbr, vbr, or vbr_hq
+  }
+}
+```
+
+**Preset Selection:**
+- **p1** - Fastest, lowest quality, ~1-2ms encoding latency
+- **p2** - Fast, good quality, ~2-3ms latency (default)
+- **p3** - Balanced, better quality, ~3-5ms latency
+- **p4** - High quality, ~5-8ms latency
+- **p5-p7** - Highest quality, 10-20ms+ latency (not recommended for streaming)
+
+**Rate Control Modes:**
+- **cbr** (Constant Bitrate) - Predictable bandwidth, best for streaming
+- **vbr** (Variable Bitrate) - Better quality, less predictable
+- **vbr_hq** - Highest quality, highest latency
+
+### Advanced Encoder Settings
+
+```json
+{
+  "video": {
+    "bf": 0,              // B-frames: 0 for lowest latency
+    "rcLookahead": 0,     // Rate control lookahead: 0 for real-time
+    "asyncDepth": 2,      // Async encoding depth
+    "surfaces": 3,        // Surface count for pipeline
+    "ignorePli": false,   // Respond to Picture Loss Indication
+    "minPliIntervalMs": 3000,        // Min 3s between keyframes
+    "minPliLossThreshold": 0.15,     // 15% loss before forcing keyframe
+    "fullRange": false    // Use limited color range
+  }
+}
+```
+
+**Low-Latency Profile:**
+```json
+{
+  "preset": "p1",
+  "rc": "cbr",
+  "bf": 0,
+  "rcLookahead": 0,
+  "asyncDepth": 1,
+  "surfaces": 2
+}
+```
+
+**High-Quality Profile:**
+```json
+{
+  "preset": "p3",
+  "rc": "vbr_hq",
+  "bf": 2,
+  "rcLookahead": 8,
+  "asyncDepth": 3,
+  "surfaces": 4
+}
+```
+
+### Bitrate Adaptation
+
+Automatic bitrate adjustment based on network conditions:
+
+```json
+{
+  "video": {
+    "bitrateController": {
+      "increaseStepBps": 1000000,    // Increase by 1 Mbps
+      "decreaseCooldownMs": 1000,     // Wait 1s after decrease
+      "cleanSamplesRequired": 3,      // 3 good samples before increase
+      "increaseIntervalMs": 1000      // Check every 1s
+    }
+  }
+}
+```
+
+**Tuning for Stability:**
+- Increase `cleanSamplesRequired` to 5-10 for more stable bitrate
+- Increase `decreaseCooldownMs` to 2000-3000ms to prevent oscillation
+- Reduce `increaseStepBps` to 500000 (500 Kbps) for gradual ramp-up
+
+### Frame Rate Pacing
+
+```json
+{
+  "video": {
+    "fps": 60,
+    "pacingFixedUs": 16666  // 16.666ms = 60fps
+  }
+}
+```
+
+**Common Frame Rates:**
+- 30fps: `pacingFixedUs: 33333`
+- 60fps: `pacingFixedUs: 16666` (default)
+- 90fps: `pacingFixedUs: 11111`
+- 120fps: `pacingFixedUs: 8333`
+- 144fps: `pacingFixedUs: 6944`
+
+## Audio Latency Optimization
+
+### Frame Size and Buffering
+
+Smaller frame sizes reduce latency but increase CPU overhead:
+
+```json
+{
+  "audio": {
+    "frameSizeMs": 10,     // 10ms frames (lowest latency)
+    "bitrate": 80000,      // 80 kbps Opus
+    "complexity": 6,       // Opus complexity 0-10
+    "enableFec": true,     // Forward Error Correction
+    "enableDtx": false,    // Discontinuous Transmission
+    "application": 2049    // OPUS_APPLICATION_RESTRICTED_LOWDELAY
+  }
+}
+```
+
+**Frame Size Trade-offs:**
+
+| Frame Size | Latency | CPU Usage | Packet Rate |
+|------------|---------|-----------|-------------|
+| 5ms | ~5ms | Very High | 200 pkt/s |
+| 10ms | ~10ms | High | 100 pkt/s (default) |
+| 20ms | ~20ms | Medium | 50 pkt/s |
+| 40ms | ~40ms | Low | 25 pkt/s |
+
+**Recommendation:** Use 10ms for competitive gaming, 20ms for casual use.
+
+### Ultra-Low Latency Mode
+
+```json
+{
+  "audio": {
+    "latency": {
+      "enforceSingleFrameBuffering": true,   // No buffering
+      "maxFrameSizeMs": 10,
+      "minFrameSizeMs": 10,
+      "strictLatencyMode": false,            // Set true for absolute minimum
+      "warnOnBuffering": true,
+      "targetOneWayLatencyMs": 40,           // Glass-to-glass target
+      "ultraLowLatencyProfile": false,       // Experimental <30ms mode
+      "disableFecInLowLatency": false        // Keep FEC enabled
+    }
+  }
+}
+```
+
+**Ultra-Low Profile (Experimental):**
+```json
+{
+  "frameSizeMs": 5,
+  "strictLatencyMode": true,
+  "ultraLowLatencyProfile": true,
+  "targetOneWayLatencyMs": 25
+}
+```
+
+⚠️ **Warning:** Ultra-low latency increases CPU usage and packet loss sensitivity.
+
+### Audio Bitrate Adaptation
+
+```json
+{
+  "audio": {
+    "bitrateAdaptation": {
+      "enabled": true,
+      "minBitrate": 64000,            // 64 kbps minimum
+      "maxBitrate": 128000,           // 128 kbps maximum
+      "decreaseCooldownMs": 2000,     // 2s cooldown after decrease
+      "increaseIntervalMs": 10000,    // Check every 10s
+      "increaseStep": 8000,           // Increase by 8 kbps
+      "highLossThreshold": 0.05,      // 5% loss triggers decrease
+      "lowLossThreshold": 0.01,       // <1% loss allows increase
+      "cleanSamplesRequired": 30,     // 30 good samples for increase
+      "fecEnableThreshold": 0.03,     // Enable FEC at 3% loss
+      "fecDisableThreshold": 0.005    // Disable FEC below 0.5% loss
+    }
+  }
+}
+```
+
+**Conservative Profile:**
+```json
+{
+  "decreaseCooldownMs": 5000,
+  "increaseIntervalMs": 20000,
+  "cleanSamplesRequired": 60
+}
+```
+
+### WASAPI Configuration
+
+```json
+{
+  "audio": {
+    "wasapi": {
+      "preferExclusiveMode": false,       // Exclusive mode for lowest latency
+      "enforceEventDriven": true,         // Event-driven capture
+      "devicePeriodMs": 5.0,              // 5ms period
+      "fallbackPeriodMs": 10.0,           // Fallback to 10ms
+      "force48kHzStereo": true,           // Always use 48kHz stereo
+      "preferLinearResampling": true,     // Fast resampling
+      "useDmoOnlyForHighQuality": false   // Use fast DMO
+    }
+  }
+}
+```
+
+**Exclusive Mode Trade-off:**
+- ✅ Pros: 2-3ms lower latency, more consistent timing
+- ❌ Cons: Blocks other applications from audio device
+
+## Capture Performance
+
+### MMCSS Priority
+
+Multimedia Class Scheduler Service ensures consistent timing:
+
+```json
+{
+  "capture": {
+    "mmcss": {
+      "enable": true,
+      "priority": 4  // 1 (low) to 7 (critical)
+    }
+  }
+}
+```
+
+**Priority Levels:**
+- **1-2**: Background capture
+- **3-4**: Normal streaming (recommended)
+- **5-6**: High priority for demanding games
+- **7**: Critical priority (may starve other processes)
+
+**Go Thread Priority:**
+```c
+// gortc_main/main.go:52-63
+static void SetupGoThreadMMCSS(void) {
+    DWORD taskIndex = 0;
+    goMMCSSHandle = AvSetMmThreadCharacteristicsA("Pro Audio", &taskIndex);
+    if (goMMCSSHandle != NULL) {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    }
+}
+```
+
+### Frame Pool and Queue Depth
+
+```json
+{
+  "capture": {
+    "copyPoolSize": 4,           // GPU copy operation pool
+    "maxQueueDepth": 2,          // Max frames in encode queue
+    "framePoolBuffers": 2,       // Frame buffer pool size
+    "minUpdateInterval100ns": 166666  // Min 16.666ms between frames (60fps)
+  }
+}
+```
+
+**Low-Latency Profile:**
+```json
+{
+  "copyPoolSize": 2,
+  "maxQueueDepth": 1,
+  "framePoolBuffers": 2
+}
+```
+
+**High-Throughput Profile:**
+```json
+{
+  "copyPoolSize": 6,
+  "maxQueueDepth": 3,
+  "framePoolBuffers": 3
+}
+```
+
+### Skip Unchanged Frames
+
+```json
+{
+  "capture": {
+    "skipUnchanged": true,         // Skip duplicate frames
+    "dropWindowMs": 500,           // Window for drop detection
+    "dropMinEvents": 12            // Min events before dropping
+  }
+}
+```
+
+Reduces bandwidth and CPU for static content (menus, lobbies).
+
+### Adaptive Backoff
+
+```json
+{
+  "capture": {
+    "adaptiveBackoff": false,         // Enable adaptive frame skipping
+    "adaptiveWindowMs": 2000,         // 2s monitoring window
+    "adaptiveEagainThreshold": 8      // EAGAIN threshold
+  }
+}
+```
+
+Set `adaptiveBackoff: true` if capture frequently reports `DXGI_ERROR_WAIT_TIMEOUT`.
+
+## Network Optimization
+
+### TURN Server Placement
+
+For clients behind restrictive NAT/firewalls:
+
+**Environment Variables:**
+```bash
+# Single TURN server
+PION_TURN_URL="turn:turn.example.com:3478"
+PION_TURN_USERNAME="username"
+PION_TURN_CREDENTIAL="password"
+
+# Multiple TURN servers (comma-separated)
+PION_TURN_URLS="turn:us-west.example.com:3478,turn:us-east.example.com:3478"
+```
+
+**Metered TURN Configuration:**
+```javascript
+// mm_server/Matchmaker.js:16-52
+const { domain, apiKey, expirySeconds } = config.metered;
+const iceServers = await getIceServers();
+// Returns: [{ urls: 'stun:...' }, { urls: 'turn:...', username: '...', credential: '...' }]
+```
+
+**Placement Best Practices:**
+- Deploy TURN servers in same region as hosts
+- Use multiple TURN servers for redundancy
+- Monitor TURN bandwidth usage (relay is expensive)
+- Set `expirySeconds` to match average session length (default: 3600s)
+
+### ICE Configuration
+
+WebRTC connection establishment:
+
+```javascript
+// Default ICE configuration
+const iceServers = [
+  { urls: 'stun:stun.l.google.com:19302' },  // Google STUN
+  { 
+    urls: ['turn:turn.example.com:3478'],
+    username: 'user',
+    credential: 'pass'
+  }
+];
+```
+
+**Connection Priority:**
+1. **Host** - Direct connection (lowest latency)
+2. **Server Reflexive** - Via STUN (low latency)
+3. **Relay** - Via TURN (higher latency, always works)
+
+### Buffer Pool Optimization
+
+```go
+// gortc_main/main.go:780-784
+var sampleBufPool = &tieredBufferPool{
+    sizes: [13]int{128, 256, 512, 1500, 4096, 8192, 
+                   16384, 32768, 65536, 131072, 262144, 524288, 1048576},
+    sizeCount: 13,
+}
+```
+
+**Tiers Explained:**
+- **128-512B**: Audio frames, small RTP packets
+- **1500B**: Standard MTU size
+- **4KB-32KB**: 1080p video frames
+- **64KB-256KB**: 4K low-motion frames
+- **512KB-1MB**: 4K high-motion frames
+
+**Memory Tuning:**
+```go
+// init (gortc_main/main.go:787-818)
+preallocCounts := [13]int{6, 6, 5, 4, 3, 2, 2, 1, 1, 1, 0, 0, 0}
+```
+
+Reduce preallocation counts if memory is constrained.
+
+## Input Processing Optimization
+
+### Adaptive Quality Control
+
+```json
+{
+  "input": {
+    "adaptiveQualityControl": {
+      "enableAdaptiveDropping": true,
+      "rttExcellentThreshold": 10.0,
+      "rttGoodThreshold": 50.0,
+      "rttFairThreshold": 100.0,
+      "rttPoorThreshold": 200.0,
+      "statsUpdateIntervalMs": 100
+    }
+  }
+}
+```
+
+Input events are prioritized based on network conditions.
+
+### Thread Priority
+
+```json
+{
+  "input": {
+    "threadPriority": {
+      "enableMMCSS": true,
+      "mmcssClass": "Games",
+      "enableTimeCritical": true,
+      "threadPriority": 15,
+      "taskName": "InputInjection"
+    }
+  }
+}
+```
+
+**Priority 15** = `THREAD_PRIORITY_TIME_CRITICAL` for lowest input latency.
+
+## Garbage Collection Tuning
+
+```go
+// gortc_main/main.go:1291-1301
+func init() {
+    // GOGC=150 means GC runs when heap is 1.5x live set
+    // Lower = more frequent GC, less memory
+    // Higher = less frequent GC, more memory
+    debug.SetGCPercent(150)
+}
+```
+
+**Memory Constrained:**
+```go
+debug.SetGCPercent(100)  // GC at 2x live heap
+```
+
+**Performance Critical:**
+```go
+debug.SetGCPercent(200)  // GC at 3x live heap (original setting)
+```
+
+## Performance Monitoring
+
+Track these metrics to validate tuning:
+
+**Video:**
+- Glass-to-glass latency < 50ms
+- Encoder latency < 5ms
+- Frame drops < 1%
+- Bitrate stability (±10% variance)
+
+**Audio:**
+- One-way latency < 40ms
+- Packet loss < 2%
+- No buffer underruns
+- Queue depth < 2.0 average
+
+**Capture:**
+- Frame time consistency (low jitter)
+- GPU copy time < 1ms
+- Queue never reaches maxQueueDepth
+
+**Network:**
+- RTT < 50ms
+- Jitter < 5ms
+- ICE connection via host/srflx (not relay)
+
+## Next Steps
+
+- [Monitoring](/operations/monitoring) - Track performance metrics
+- [Troubleshooting](/operations/troubleshooting) - Fix performance issues

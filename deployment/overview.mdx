@@ -1,0 +1,173 @@
+---
+title: Deployment Overview
+description: Complete deployment guide for CloudGaming - a low-latency WebRTC cloud gaming platform
+---
+
+## Architecture Overview
+
+CloudGaming is a peer-to-peer cloud gaming and remote desktop solution that streams Windows applications to browsers with ultra-low latency using WebRTC.
+
+```
+Browser Client
+    │  WebSocket (SDP/ICE)
+    ▼
+Signaling Server (Node.js :3002)  ◄──► Redis Pub/Sub (multi-node)
+    │
+    ▼
+Windows Host (C++ / Go)
+  ├─ WGC Capture  →  D3D11 GPU copy  →  FFmpeg NVENC/QSV/AMF H.264
+  ├─ WASAPI Audio  →  Opus encode
+  └─ Pion WebRTC  ──── SRTP video+audio ──►  Client
+                   ◄─── DataChannels (input) ──  Client
+
+Matchmaker (Node.js :3000)  — host registration & session assignment
+```
+
+## Components
+
+The platform consists of four main components:
+
+| Component | Technology | Purpose |
+|-----------|------------|----------|
+| **Windows Host** | C++ (WGC), Go (Pion WebRTC) | Captures and encodes game video/audio, handles input |
+| **Signaling Server** | Node.js, WebSocket, Redis | Coordinates WebRTC connections between hosts and clients |
+| **Matchmaker** | Node.js, Express, Redis | Manages host registration and assigns clients to available hosts |
+| **Client** | HTML5, WebRTC | Browser-based game streaming client |
+
+## Prerequisites
+
+### For All Components
+
+- Node.js 16+ and npm
+- Redis 6+ (for production multi-instance deployment)
+- Git
+
+### For Windows Host
+
+<Warning>
+The Windows host requires a modern NVIDIA, Intel, or AMD GPU with hardware encoding support.
+</Warning>
+
+- Windows 10 version 1903+ or Windows 11
+- Visual Studio 2019 or 2022 with C++ desktop development workload
+- NVIDIA GPU (NVENC), Intel GPU (QuickSync), or AMD GPU (AMF)
+- FFmpeg with hardware encoding libraries
+- Go 1.19+ (for WebRTC stack)
+
+### For Production Deployment
+
+- **Signaling Server**: 1-2 GB RAM, websocket support
+- **Matchmaker**: 512 MB RAM minimum
+- **Redis**: 256 MB RAM minimum, persistent storage recommended
+- **Windows Host**: 4+ GB RAM, dedicated GPU, Windows Server or Desktop
+
+## Deployment Order
+
+<Steps>
+
+<Step title="Deploy Redis">
+Set up Redis first as both the signaling server and matchmaker depend on it.
+
+```bash
+# Local development
+redis-server
+
+# Production: Use managed Redis (Railway, AWS ElastiCache, etc.)
+```
+</Step>
+
+<Step title="Deploy Signaling Server">
+Deploy the WebSocket signaling server that coordinates WebRTC connections.
+
+See [Signaling Server Deployment](/deployment/signaling-server)
+</Step>
+
+<Step title="Deploy Matchmaker">
+Deploy the matchmaker service for host registration and client assignment.
+
+See [Matchmaker Deployment](/deployment/matchmaker)
+</Step>
+
+<Step title="Build and Run Windows Host">
+Compile the C++ host application and configure it to connect to your signaling and matchmaker services.
+
+See [Host Setup](/deployment/host-setup)
+</Step>
+
+<Step title="Deploy Client">
+Host the static HTML client on any web server or CDN.
+
+See [Client Deployment](/deployment/client)
+</Step>
+
+</Steps>
+
+## Production Architecture
+
+For production deployments, consider this setup:
+
+- **Multiple Signaling Servers**: Scale horizontally behind a load balancer, using Redis pub/sub for cross-instance communication
+- **Matchmaker**: Single instance or active-standby for high availability
+- **Redis**: Managed Redis with persistence and automatic failover
+- **Windows Hosts**: Multiple hosts in different regions for load distribution
+- **Client**: Served via CDN (Cloudflare, Vercel, etc.) with HTTPS
+
+## Environment Configuration
+
+Key environment variables used across components:
+
+| Variable | Component | Purpose | Default |
+|----------|-----------|---------|----------|
+| `REDIS_URL` | Signaling, Matchmaker | Redis connection string | `redis://127.0.0.1:6379` |
+| `WS_PORT` | Signaling Server | WebSocket port | `3002` |
+| `PORT` | Matchmaker | HTTP API port | `3000` |
+| `HOST_SECRET` | Matchmaker, Host | Shared secret for host authentication | `to-change-in-prod` |
+| `SIGNALING_PUBLIC_URL` | Matchmaker | Public WSS URL for clients | - |
+
+<Note>
+All services support `.env` files for configuration. See individual deployment guides for complete variable lists.
+</Note>
+
+## Quick Start (Local Development)
+
+For local testing, you can run all components on a single machine:
+
+```bash
+# Terminal 1: Redis
+redis-server
+
+# Terminal 2: Signaling Server
+cd Server
+npm install
+npm start
+
+# Terminal 3: Matchmaker
+cd Server
+node mm_server/Matchmaker.js
+
+# Terminal 4: Client
+cd Client/html-server
+npx http-server . -p 8080
+
+# Terminal 5: Build and run Host (see host-setup.mdx)
+```
+
+## Security Considerations
+
+<Warning>
+Before deploying to production:
+
+- Change `HOST_SECRET` to a strong random value
+- Enable WSS (WebSocket Secure) by setting `REQUIRE_WSS=true`
+- Configure `ALLOWED_ORIGINS` to restrict client origins
+- Use HTTPS for the matchmaker API
+- Consider enabling JWT authentication with `ENABLE_AUTH=true`
+- Set up firewall rules to protect Redis
+</Warning>
+
+## Next Steps
+
+- [Windows Host Setup](/deployment/host-setup) - Build and configure the Windows capture host
+- [Signaling Server](/deployment/signaling-server) - Deploy the WebRTC signaling infrastructure
+- [Matchmaker](/deployment/matchmaker) - Set up host registration and session management
+- [Client Deployment](/deployment/client) - Host the browser client

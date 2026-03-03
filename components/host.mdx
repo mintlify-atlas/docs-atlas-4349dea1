@@ -1,0 +1,522 @@
+---
+title: 'Host Runtime'
+description: 'C++ host runtime internals: capture, encoding, and WebRTC streaming'
+---
+
+# Host Runtime
+
+The CloudGaming host is a high-performance C++ application that captures game video/audio and streams it to clients via WebRTC.
+
+## Architecture Overview
+
+The host runtime consists of several specialized subsystems:
+
+- **Video Capture**: Windows Graphics Capture (WGC) + D3D11
+- **Audio Capture**: WASAPI with process loopback
+- **Video Encoding**: FFmpeg with hardware acceleration (NVENC/QSV/AMF)
+- **Audio Encoding**: Opus codec
+- **WebRTC Transport**: Go/Pion for peer connection management
+- **Input Handling**: Direct input injection
+
+<Tabs>
+  <Tab title="Video Pipeline">
+    ## Video Capture & Encoding Pipeline
+
+    ### Windows Graphics Capture (WGC)
+
+    The host uses Windows Graphics Capture API to capture the game window at the compositor level:
+
+    ```cpp
+    // From Host/main.cpp:113-129
+    auto item = WindowUtils::CreateItem(hwnd);
+    GraphicsAndCapture::CaptureContext cap;
+    GraphicsAndCapture::InitializeCapture(cap, d3d, item);
+    GraphicsAndCapture::Start(cap);
+    ```
+
+    **Key Features:**
+    - Compositor-level capture (no game modification needed)
+    - Hardware-accelerated texture sharing
+    - Support for windowed and fullscreen modes
+    - Configurable frame pacing via `MinUpdateInterval`
+
+    ### D3D11 Video Processing
+
+    BGRA textures from WGC are converted to NV12 using D3D11 VideoProcessor for optimal encoder compatibility:
+
+    ```cpp
+    // From Host/Encoder.cpp:481-553
+    static bool InitializeVideoProcessor(ID3D11Device* device, int width, int height) {
+        // Create VideoProcessor for BGRA -> NV12 conversion
+        g_videoDevice->CreateVideoProcessorEnumerator(&desc, g_vpEnumerator.GetAddressOf());
+        g_videoDevice->CreateVideoProcessor(g_vpEnumerator.Get(), 0, g_videoProcessor.GetAddressOf());
+        
+        // Set BT.709 color space for accurate color reproduction
+        D3D11_VIDEO_PROCESSOR_COLOR_SPACE inputCS{};
+        inputCS.RGB_Range = 0;      // full-range RGB (0-255)
+        inputCS.YCbCr_Matrix = 1;   // BT.709 (HD)
+        inputCS.Nominal_Range = 2;  // 0-255 full range
+        g_videoContext->VideoProcessorSetStreamColorSpace(g_videoProcessor.Get(), 0, &inputCS);
+    }
+    ```
+
+    **Optimizations:**
+    - LRU cache for D3D11 views (avoids per-frame allocations)
+    - Pre-validated format support
+    - Primed texture views for first-frame performance
+
+    ### Hardware Encoding
+
+    The encoder automatically selects the best hardware encoder based on GPU vendor:
+
+    <Accordion title="NVIDIA NVENC Configuration">
+      ```cpp
+      // From Host/Encoder.cpp:1193-1227
+      case 0x10DE: // NVIDIA
+          encoderName = "h264_nvenc";
+          av_dict_set(&opts, "preset", "p5", 0);      // Fast low-latency
+          av_dict_set(&opts, "tune", "ull", 0);       // Ultra-low-latency
+          av_dict_set(&opts, "rc", "cbr", 0);         // Constant bitrate
+          av_dict_set(&opts, "async_depth", "2", 0);  // Minimal buffering
+          av_dict_set(&opts, "surfaces", "3", 0);     // async_depth + 1
+          av_dict_set(&opts, "spatial_aq", "1", 0);   // Adaptive quantization
+          av_dict_set(&opts, "aq-strength", "4", 0);  // Balanced quality/speed
+      ```
+
+      **Low-Latency Settings:**
+      - VBV buffer = 1x bitrate (minimal buffering)
+      - B-frames disabled
+      - Repeat headers enabled for keyframe recovery
+      - BT.709 color metadata in SPS VUI
+    </Accordion>
+
+    <Accordion title="Intel QSV Configuration">
+      ```cpp
+      // From Host/Encoder.cpp:1252-1257
+      case 0x8086: // Intel
+          encoderName = "h264_qsv";
+          av_dict_set(&opts, "preset", "veryfast", 0);
+          av_dict_set(&opts, "zerolatency", "1", 0);
+          av_dict_set(&opts, "repeat-headers", "1", 0);
+      ```
+    </Accordion>
+
+    <Accordion title="AMD AMF Configuration">
+      ```cpp
+      // From Host/Encoder.cpp:1258-1262
+      case 0x1002: // AMD
+          encoderName = "h264_amf";
+          av_dict_set(&opts, "usage", "lowlatency_high_quality", 0);
+          av_dict_set(&opts, "repeat-headers", "1", 0);
+      ```
+    </Accordion>
+
+    ### Frame Ring Buffer
+
+    A ring buffer of hardware frames minimizes allocation overhead:
+
+    ```cpp
+    // From Host/Encoder.cpp:140-143
+    static std::vector<AVFrame*> g_hwFrames;
+    static int g_hwFrameIndex = 0;
+    static int g_hwFramePoolSize = 4; // Configurable pool size
+
+    // From Host/Encoder.cpp:695-702
+    bool AcquireHwInputSurface(int &slotIndexOut, ID3D11Texture2D** nv12TextureOut) {
+        slotIndexOut = g_hwFrameIndex;
+        g_hwFrameIndex = (g_hwFrameIndex + 1) % static_cast<int>(g_hwFrames.size());
+        AVFrame* hw = g_hwFrames[slotIndexOut];
+        *nv12TextureOut = (ID3D11Texture2D*)hw->data[0];
+        return true;
+    }
+    ```
+
+    ### Bitrate Adaptation
+
+    Adaptive bitrate control responds to network congestion:
+
+    ```cpp
+    // From Host/Encoder.cpp:923-975
+    void OnRtcpFeedback(double packetLoss, double rtt, double jitter) {
+        auto now = std::chrono::steady_clock::now();
+        auto since = std::chrono::duration_cast<std::chrono::milliseconds>(now - g_lastChange).count();
+        
+        // Reduce bitrate on packet loss
+        if (packetLoss >= g_minPliLossThreshold.load()) {
+            if (since >= g_decreaseCooldownMs) {
+                g_congestionCeiling = static_cast<int>(g_currentBitrate * 0.9);
+                double factor = (packetLoss >= 0.10) ? 0.6 : 0.8;
+                int target = static_cast<int>(g_currentBitrate * factor);
+                g_currentBitrate = std::max(g_minBitrateController, target);
+                AdjustBitrate(g_currentBitrate);
+            }
+        }
+        
+        // Increase bitrate when stable
+        g_cleanSamples++;
+        if (since >= g_increaseIntervalMs && g_cleanSamples >= g_cleanSamplesRequired) {
+            int target = g_currentBitrate + g_increaseStep;
+            if (target <= effectiveMax) {
+                g_currentBitrate = target;
+                AdjustBitrate(g_currentBitrate);
+            }
+        }
+    }
+    ```
+
+    **Default Values (WAN-optimized):**
+    - Start: 8 Mbps
+    - Min: 4 Mbps
+    - Max: 12 Mbps
+    - Increase step: +1 Mbps
+    - Decrease cooldown: 1000ms
+  </Tab>
+
+  <Tab title="Audio Pipeline">
+    ## Audio Capture & Encoding Pipeline
+
+    ### WASAPI Process Loopback
+
+    Audio is captured using WASAPI loopback mode targeting the specific game process:
+
+    ```cpp
+    // From Host/AudioCapturer.cpp:272-299
+    bool StartCapture(DWORD processId, const std::string& processName) {
+        // Set MMCSS priority for audio capture thread
+        ThreadPriorityManager::ThreadPriorityConfig audioConfig;
+        audioConfig.mmcssClass = ThreadPriorityManager::MMCSSClass::Audio;
+        audioConfig.taskName = "AudioCapture";
+        audioConfig.enableMMCSS = true;
+        audioConfig.threadPriority = THREAD_PRIORITY_HIGHEST;
+        
+        // Initialize Opus encoder
+        OpusEncoderWrapper::Settings settings;
+        settings.sampleRate = 48000;
+        settings.channels = s_audioConfig.channels;        // Configurable
+        settings.frameSize = frameSizeSamples;             // 10ms default
+        settings.bitrate = s_audioConfig.bitrate;          // 64-96 kbps
+        settings.complexity = s_audioConfig.complexity;    // 5-6 recommended
+        settings.application = 2049;  // OPUS_APPLICATION_AUDIO for full-band
+    }
+    ```
+
+    ### Opus Encoding
+
+    Low-latency Opus configuration for gaming audio:
+
+    ```cpp
+    // From Host/AudioCapturer.cpp:321-372
+    settings.frameSize = (5 * 48000) / 1000;  // 5ms frames for ultra-low-latency
+    settings.bitrate = 48000;                 // 48 kbps for low delay
+    settings.enableFec = false;               // Disable FEC in low-latency mode
+    settings.complexity = 4;                  // Balanced encoding speed
+    settings.useVbr = true;
+    settings.constrainedVbr = true;
+    settings.enableDtx = false;               // No discontinuous transmission for games
+    ```
+
+    **Frame Duration Options:**
+    - 5ms: Ultra-low-latency (5ms algorithmic delay)
+    - 10ms: Default (balanced latency/quality)
+    - 20ms: Higher quality (more buffering)
+
+    ### Channel Remapping
+
+    Robust multi-channel audio handling:
+
+    ```cpp
+    // From Host/AudioCapturer.cpp:121-176
+    static bool RemapInterleavedChannelsInPlace(std::vector<float>& interleaved, 
+                                                 uint32_t inChannels, 
+                                                 uint32_t outChannels) {
+        if (outChannels == 2 && inChannels > 2) {
+            // Stereo fold-down from multi-channel
+            for (size_t f = 0; f < frames; ++f) {
+                const size_t base = f * inChannels;
+                const float left  = interleaved[base + 0];
+                const float right = interleaved[base + 1];
+                float surroundSum = 0.0f;
+                for (uint32_t c = 2; c < inChannels; ++c) 
+                    surroundSum += interleaved[base + c];
+                const float surroundAvg = (inChannels > 2) ? 
+                    (surroundSum / static_cast<float>(inChannels - 2)) : 0.0f;
+                
+                g_audioTempBuffer[f * 2 + 0] = 0.85f * left  + 0.15f * surroundAvg;
+                g_audioTempBuffer[f * 2 + 1] = 0.85f * right + 0.15f * surroundAvg;
+            }
+        }
+    }
+    ```
+
+    ### Dedicated Encoder Thread
+
+    Opus encoding runs on a separate thread to avoid blocking capture:
+
+    ```cpp
+    // From Host/AudioCapturer.cpp:917-979
+    void StartEncoderThread() {
+        m_encoderThread = std::thread([this]() {
+            // Register with MMCSS for real-time priority
+            m_hEncoderMmcssTask = AvSetMmThreadCharacteristicsW(L"Pro Audio", &m_encoderMmcssTaskIndex);
+            AvSetMmThreadPriority(m_hEncoderMmcssTask, AVRT_PRIORITY_HIGH);
+            
+            // Main encoding loop
+            while (!m_stopEncoder) {
+                if (PopFrameFromRingBuffer(frame, timestamp)) {
+                    RawAudioFrame rawFrame;
+                    rawFrame.samples = std::move(frame);
+                    rawFrame.timestampUs = timestamp;
+                    EncodeAndQueueFrame(rawFrame);
+                }
+            }
+        });
+    }
+    ```
+
+    ### Ring Buffer Architecture
+
+    Lock-free ring buffer minimizes latency:
+
+    - Capture thread: Writes PCM samples
+    - Encoder thread: Reads and encodes
+    - Queue processor: Sends to WebRTC
+
+    **Buffering Limits:**
+    - Ring buffer: 16 frames (configurable)
+    - Send queue: 16 packets (low-latency)
+    - Enforced single-frame buffering in strict mode
+  </Tab>
+
+  <Tab title="WebRTC Integration">
+    ## Go/Pion WebRTC Integration
+
+    ### Peer Connection Setup
+
+    The host uses Go/Pion for WebRTC transport:
+
+    ```go
+    // From gortc_main/main.go:1678-1750
+    func createPeerConnectionGo() C.int {
+        // Build ICE servers from environment
+        iceServers := buildICEServersFromEnv()
+        
+        // Configure for low-latency streaming
+        config := webrtc.Configuration{
+            ICEServers: iceServers,
+        }
+        
+        pc, err := webrtc.NewPeerConnection(config)
+        if err != nil {
+            return -1
+        }
+        
+        peerConnection = pc
+        return 0
+    }
+    ```
+
+    ### Video Track (Sample-based)
+
+    ```go
+    // From gortc_main/main.go:1535-1585
+    func sendVideoSample(data unsafe.Pointer, size C.int, durationUs C.longlong) C.int {
+        // Validate duration for proper pacing
+        durationValue := int64(durationUs)
+        if !validateVideoDuration(durationValue) {
+            return -3
+        }
+        
+        // Use buffer pool to avoid allocations
+        n := int(size)
+        buf := getSampleBuf(n)
+        C.memcpy(unsafe.Pointer(&buf[0]), data, C.size_t(n))
+        dur := time.Duration(durationValue) * time.Microsecond
+        
+        // Queue sample with backpressure handling
+        sample := media.Sample{Data: buf, Duration: dur}
+        select {
+        case videoSendQueue <- sample:
+            return 0
+        default:
+            // Drop oldest frame if queue full
+            select {
+            case oldestSample := <-videoSendQueue:
+                putSampleBuf(oldestSample.Data)
+                videoSendQueue <- sample
+            }
+        }
+    }
+    ```
+
+    ### Audio Track (RTP-based)
+
+    ```go
+    // From gortc_main/main.go:1342-1533
+    func sendAudioPacket(data unsafe.Pointer, size C.int, pts C.longlong) C.int {
+        // Lock-free audio RTP state management
+        if !audioRTPState.IsBaselineSet() {
+            audioRTPState.SetBaseline(int64(pts))
+        }
+        
+        // Atomic sequence/timestamp operations
+        packetSequence := audioRTPState.GetNextSequence()
+        packetRTPTimestamp := audioRTPState.GetNextTimestamp()
+        
+        // Create RTP packet
+        pkt := &rtp.Packet{
+            Header: rtp.Header{
+                Version:        2,
+                PayloadType:    audioPayloadType,
+                SequenceNumber: packetSequence,
+                Timestamp:      packetRTPTimestamp,
+                SSRC:           audioSSRC,
+                Marker:         true,
+            },
+            Payload: payload,
+        }
+        
+        // Queue for dedicated sender goroutine
+        audioSendQueue <- pkt
+    }
+    ```
+
+    ### Buffer Pool System
+
+    Tiered buffer pool for zero-allocation streaming:
+
+    ```go
+    // From gortc_main/main.go:751-869
+    type tieredBufferPool struct {
+        pools  [13]sync.Pool
+        sizes  [13]int  // 128B to 1MB for 4K support
+        hits   [13]int64
+        misses [13]int64
+    }
+    
+    var sampleBufPool = &tieredBufferPool{
+        sizes: [13]int{128, 256, 512, 1500, 4096, 8192, 16384, 
+                       32768, 65536, 131072, 262144, 524288, 1048576},
+        sizeCount: 13,
+    }
+    
+    func getSampleBuf(n int) []byte {
+        tier := sampleBufPool.getBufferTier(n)
+        targetSize := sampleBufPool.sizes[tier]
+        
+        v := sampleBufPool.pools[tier].Get()
+        if v == nil {
+            return make([]byte, targetSize)[:n]
+        }
+        return v.([]byte)[:n]
+    }
+    ```
+
+    **Performance Benefits:**
+    - 95%+ hit rate minimizes heap allocations
+    - Zero GC pressure from buffer reuse
+    - Predictable latency (no allocation jitter)
+
+    ### Data Channels
+
+    ```go
+    // Keyboard input (ordered, reliable)
+    dataChannel, _ = peerConnection.CreateDataChannel("keyPressChannel", 
+        &webrtc.DataChannelInit{Ordered: newTrue()})
+    
+    // Mouse input (unordered, unreliable for low latency)
+    mouseChannel, _ = peerConnection.CreateDataChannel("mouseChannel",
+        &webrtc.DataChannelInit{Ordered: newFalse(), MaxRetransmits: newZero()})
+    
+    // Video feedback (ping/pong for latency measurement)
+    videoFeedbackChannel, _ = peerConnection.CreateDataChannel("videoFeedbackChannel",
+        &webrtc.DataChannelInit{Ordered: newFalse(), MaxRetransmits: newZero()})
+    ```
+  </Tab>
+
+  <Tab title="Input System">
+    ## Input Injection System
+
+    ### Input Processing
+
+    The host processes input from WebRTC data channels:
+
+    ```cpp
+    // From Host/main.cpp:46-56
+    if (!InputIntegrationLayer::initialize()) {
+        std::cerr << "Failed to initialize input integration layer" << std::endl;
+        return -1;
+    }
+    
+    if (!InputIntegrationLayer::start()) {
+        std::cerr << "Failed to start input integration layer" << std::endl;
+        return -1;
+    }
+    ```
+
+    ### Configuration
+
+    Input behavior is configurable via `config.json`:
+
+    ```json
+    {
+      "host": {
+        "input": {
+          "enabled": true,
+          "keyboard": {
+            "enabled": true,
+            "method": "sendinput"
+          },
+          "mouse": {
+            "enabled": true,
+            "method": "sendinput",
+            "relative": false
+          }
+        }
+      }
+    }
+    ```
+
+    **Input Methods:**
+    - `sendinput`: Windows SendInput API (recommended)
+    - `direct`: Direct driver injection (requires admin)
+
+    ### Thread Priority
+
+    Input threads use MMCSS for consistent timing:
+
+    ```cpp
+    // From Host/main.cpp:123-125
+    ConfigUtils::ApplyThreadPrioritySettings(config);
+    ```
+
+    This elevates keyboard/mouse processing threads to real-time priority classes to minimize input latency.
+  </Tab>
+</Tabs>
+
+## Key Source Files
+
+<CardGroup cols={2}>
+  <Card title="Encoder.cpp" icon="film" href="https://github.com/yourusername/cloudgaming/blob/main/Host/Encoder.cpp">
+    Video encoding pipeline with hardware acceleration and adaptive bitrate control.
+  </Card>
+  
+  <Card title="AudioCapturer.cpp" icon="microphone" href="https://github.com/yourusername/cloudgaming/blob/main/Host/AudioCapturer.cpp">
+    WASAPI audio capture with Opus encoding and dedicated processing threads.
+  </Card>
+  
+  <Card title="main.cpp" icon="play" href="https://github.com/yourusername/cloudgaming/blob/main/Host/main.cpp">
+    Main entry point with configuration loading and component initialization.
+  </Card>
+  
+  <Card title="main.go" icon="code" href="https://github.com/yourusername/cloudgaming/blob/main/gortc_main/main.go">
+    Go/Pion WebRTC integration with buffer pool and RTP packet handling.
+  </Card>
+</CardGroup>
+
+<Note>
+  **Performance Tips:**
+  - Use NVENC preset `p5` for best latency/quality balance
+  - Set audio frame size to 5ms for ultra-low-latency
+  - Enable adaptive bitrate control for WAN deployments
+  - Monitor EAGAIN events to detect encoder congestion
+</Note>

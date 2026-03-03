@@ -1,0 +1,793 @@
+---
+title: 'Browser Client'
+description: 'WebRTC browser client with optimized video rendering and input forwarding'
+---
+
+# Browser Client
+
+The CloudGaming client is a browser-based application that receives video/audio streams via WebRTC and forwards input to the host.
+
+## Architecture Overview
+
+The client consists of:
+
+- **WebRTC Peer Connection**: Video/audio track reception
+- **Video Rendering**: Hardware-accelerated direct rendering
+- **Audio Playback**: Dedicated audio element with low-latency configuration
+- **Input Capture**: Keyboard/mouse event forwarding via DataChannels
+- **Latency Measurement**: Round-trip time tracking via ping/pong
+- **Matchmaker Integration**: Automatic host discovery
+
+## Implementation
+
+<Tabs>
+  <Tab title="Connection Setup">
+    ## WebRTC Connection Establishment
+
+    ### Peer Connection Creation
+
+    ```javascript
+    // From Client/html-server/index.html:1167-1450
+    function createPeerConnection() {
+        if (peerConnection) {
+            log("PeerConnection already exists, not creating again.");
+            return;
+        }
+        
+        // Configure with ICE servers (STUN/TURN)
+        const config = {
+            iceServers: currentIceServers,
+        };
+        
+        peerConnection = new RTCPeerConnection(config);
+        
+        // Handle remote tracks (video/audio)
+        peerConnection.ontrack = (event) => {
+            handleRemoteTrack(event);
+        };
+        
+        // Forward ICE candidates to signaling server
+        peerConnection.onicecandidate = (event) => {
+            if (event.candidate) {
+                ws.send(JSON.stringify({
+                    type: 'candidate',
+                    candidate: event.candidate.candidate,
+                    sdpMid: event.candidate.sdpMid,
+                    sdpMLineIndex: event.candidate.sdpMLineIndex
+                }));
+            }
+        };
+        
+        // Monitor connection state
+        peerConnection.oniceconnectionstatechange = () => {
+            log('ICE connection state: ' + peerConnection.iceConnectionState);
+            if (peerConnection.iceConnectionState === 'connected') {
+                updateConnectionStatus('connected', 'ICE Connected');
+            } else if (peerConnection.iceConnectionState === 'disconnected') {
+                updateConnectionStatus('disconnected', 'ICE Disconnected');
+                stopRenderingLoop();
+            }
+        };
+        
+        // Create data channels
+        dataChannel = peerConnection.createDataChannel("keyPressChannel", { ordered: true });
+        mouseChannel = peerConnection.createDataChannel("mouseChannel", { ordered: false, maxRetransmits: 0 });
+        videoFeedbackChannel = peerConnection.createDataChannel("videoFeedbackChannel", { ordered: false, maxRetransmits: 0 });
+    }
+    ```
+
+    ### SDP Negotiation
+
+    ```javascript
+    // From Client/html-server/index.html:1584-1629
+    async function startConnection() {
+        createPeerConnection();
+        
+        // Add transceivers for receiving streams
+        if (!peerConnection.getTransceivers().some(t => t.receiver?.track?.kind === 'video')) {
+            peerConnection.addTransceiver('video', { direction: 'recvonly' });
+            log("Added video transceiver.");
+        }
+        
+        if (!peerConnection.getTransceivers().some(t => t.receiver?.track?.kind === 'audio')) {
+            peerConnection.addTransceiver('audio', { direction: 'recvonly' });
+            log("Added audio transceiver.");
+        }
+        
+        // Create and send offer
+        if (peerConnection.signalingState === 'stable' || peerConnection.signalingState === 'new') {
+            const offer = await peerConnection.createOffer();
+            await peerConnection.setLocalDescription(offer);
+            
+            ws.send(JSON.stringify({
+                type: 'offer',
+                sdp: offer.sdp
+            }));
+        }
+    }
+    
+    async function handleAnswer(answerMsg) {
+        if (peerConnection.signalingState !== 'have-local-offer') {
+            log("Not expecting answer in current state", 'warn');
+            return;
+        }
+        
+        const remoteDesc = new RTCSessionDescription({ 
+            type: 'answer', 
+            sdp: answerMsg.sdp 
+        });
+        await peerConnection.setRemoteDescription(remoteDesc);
+        log('Remote description (answer) set.');
+    }
+    ```
+
+    ### Signaling via WebSocket
+
+    ```javascript
+    // From Client/html-server/index.html:1048-1164
+    function connectToSignalingServer(roomId, signalingUrl) {
+        currentRoomId = roomId;
+        const serverUrl = `${signalingUrl}?roomId=${roomId}`;
+        
+        ws = new WebSocket(serverUrl);
+        
+        ws.onopen = () => {
+            log('Connected to signaling server');
+            startConnection();
+        };
+        
+        ws.onmessage = async (event) => {
+            const msg = JSON.parse(event.data);
+            
+            switch (msg.type) {
+                case 'answer':
+                    await handleAnswer(msg);
+                    break;
+                    
+                case 'candidate':
+                    const ice = { 
+                        candidate: msg.candidate, 
+                        sdpMid: msg.sdpMid, 
+                        sdpMLineIndex: msg.sdpMLineIndex 
+                    };
+                    await peerConnection.addIceCandidate(new RTCIceCandidate(ice));
+                    break;
+                    
+                case 'peer-disconnected':
+                    log('Peer has disconnected', 'warn');
+                    updateConnectionStatus('disconnected', 'Peer Left');
+                    break;
+            }
+        };
+        
+        ws.onclose = (event) => {
+            log(`WebSocket closed. Code: ${event.code}`, 'warn');
+            stopRenderingLoop();
+            
+            // Exponential backoff reconnect
+            let attempt = 0;
+            const tryReconnect = () => {
+                attempt++;
+                const delay = Math.min(1000 * Math.pow(2, attempt - 1), 15000);
+                setTimeout(() => connectToSignalingServer(currentRoomId, signalingUrl), delay);
+            };
+            tryReconnect();
+        };
+    }
+    ```
+  </Tab>
+
+  <Tab title="Video Rendering">
+    ## Hardware-Accelerated Video Rendering
+
+    ### Direct Video Element Rendering
+
+    The client uses direct `<video>` element rendering for optimal performance:
+
+    ```javascript
+    // From Client/html-server/index.html:1187-1261
+    peerConnection.ontrack = (event) => {
+        if (event.track.kind === 'video') {
+            const stream = (event.streams && event.streams[0]) 
+                ? event.streams[0] 
+                : new MediaStream([event.track]);
+            
+            // Attach stream to hidden video element
+            hiddenVideoElement.srcObject = stream;
+            
+            // Configure receiver for minimum latency
+            const receiver = event.receiver;
+            if (receiver) {
+                if (receiver.playoutDelayHint !== undefined) {
+                    receiver.playoutDelayHint = 0;
+                    log('Set playoutDelayHint = 0 for minimum jitter buffer');
+                }
+                if (receiver.jitterBufferTarget !== undefined) {
+                    receiver.jitterBufferTarget = 0;
+                    log('Set jitterBufferTarget = 0 for minimum jitter buffer');
+                }
+            }
+            
+            // Start playback
+            hiddenVideoElement.play().then(() => {
+                log('Video started playing, activating direct hardware rendering');
+                
+                // Enable direct rendering (bypass canvas)
+                hiddenVideoElement.classList.add('bg-video');
+                startRenderingLoop();
+                hideLoadingOverlay();
+            });
+        }
+    };
+    ```
+
+    ### Why Direct Rendering?
+
+    **Canvas Rendering Issues**:
+    - Software color conversion (BT.709 → sRGB)
+    - Extra copy from GPU → CPU → GPU
+    - Skia color management overhead
+    - Frame synchronization issues
+
+    **Direct Video Benefits**:
+    - Hardware color pipeline (GPU-native BT.709)
+    - Zero-copy rendering
+    - Vsync synchronization
+    - Lower CPU usage
+
+    ### Video Element Configuration
+
+    ```html
+    <!-- From Client/html-server/index.html:562 -->
+    <video id="hiddenVideo" autoplay playsinline muted></video>
+    ```
+
+    ```css
+    /* From Client/html-server/index.html:291-303 */
+    #hiddenVideo { display: none; pointer-events: none; }
+    #hiddenVideo.bg-video {
+      display: block;
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      background: #000;
+      z-index: 1;
+      pointer-events: none;
+    }
+    ```
+
+    The `bg-video` class is added after the stream starts playing, making the video element visible.
+
+    ### FPS Monitoring
+
+    ```javascript
+    // From Client/html-server/index.html:948-973
+    function scheduleVideoFrameCallback() {
+        if (!renderActive || !('requestVideoFrameCallback' in hiddenVideoElement)) return;
+        
+        // Use rVFC for accurate frame timing
+        hiddenVideoElement.requestVideoFrameCallback(() => {
+            if (!renderActive) return;
+            
+            frameCount++;
+            const currentTime = Date.now();
+            if (currentTime - lastFrameTime >= 1000) {
+                fps = Math.round((frameCount * 1000) / (currentTime - lastFrameTime));
+                frameCount = 0;
+                lastFrameTime = currentTime;
+                updatePerformanceDisplay();
+            }
+            
+            scheduleVideoFrameCallback();
+        });
+    }
+    ```
+
+    Uses `requestVideoFrameCallback` for precise per-frame timing.
+
+    ### WebRTC Stats Collection
+
+    ```javascript
+    // From Client/html-server/index.html:1236-1260
+    let lastFramesDecoded = 0;
+    let lastBytes = 0;
+    let lastStatsTime = performance.now();
+    
+    activeStatsTimer = setInterval(async () => {
+        if (!peerConnection) return;
+        
+        const stats = await peerConnection.getStats();
+        let inbound = null;
+        stats.forEach(report => {
+            if (report.type === 'inbound-rtp' && report.kind === 'video') {
+                inbound = report;
+            }
+        });
+        
+        if (!inbound) return;
+        
+        const now = performance.now();
+        const dt = Math.max(1, now - lastStatsTime);
+        const frames = inbound.framesDecoded || 0;
+        const bytes = inbound.bytesReceived || 0;
+        
+        netFps = Math.round(((frames - lastFramesDecoded) * 1000) / dt);
+        bitrateKbps = Math.round(((bytes - lastBytes) * 8) / dt);
+        
+        lastFramesDecoded = frames;
+        lastBytes = bytes;
+        lastStatsTime = now;
+        
+        updatePerformanceDisplay();
+    }, 1000);
+    ```
+
+    Monitors decoded frames and bitrate for quality metrics.
+  </Tab>
+
+  <Tab title="Audio Playback">
+    ## Low-Latency Audio Playback
+
+    ### Dedicated Audio Element
+
+    ```javascript
+    // From Client/html-server/index.html:690-702
+    let hiddenAudioElement = null;
+    function createHiddenAudioElement() {
+        if (!hiddenAudioElement) {
+            hiddenAudioElement = document.createElement('audio');
+            hiddenAudioElement.style.display = 'none';
+            hiddenAudioElement.autoplay = true;
+            hiddenAudioElement.muted = false;
+            hiddenAudioElement.volume = 1.0;
+            document.body.appendChild(hiddenAudioElement);
+            log('Created hidden audio element for fallback audio playback');
+        }
+        return hiddenAudioElement;
+    }
+    ```
+
+    ### Audio Track Handling
+
+    ```javascript
+    // From Client/html-server/index.html:1262-1319
+    peerConnection.ontrack = (event) => {
+        if (event.track.kind === 'audio') {
+            log('Received audio track, setting up dedicated audio playback');
+            
+            // Ensure audio track is enabled
+            event.track.enabled = true;
+            
+            // Configure receiver for minimum latency
+            const receiver = event.receiver;
+            if (receiver) {
+                if (receiver.playoutDelayHint !== undefined) {
+                    receiver.playoutDelayHint = 0;
+                    log('Set audio playoutDelayHint = 0');
+                }
+                if (receiver.jitterBufferTarget !== undefined) {
+                    receiver.jitterBufferTarget = 10;  // 10ms minimum
+                    log('Set audio jitterBufferTarget = 10ms');
+                }
+            }
+            
+            // Use dedicated audio element
+            const audioElement = createHiddenAudioElement();
+            const audioStream = new MediaStream([event.track]);
+            audioElement.srcObject = audioStream;
+            audioElement.muted = false;
+            audioElement.volume = 1.0;
+            
+            // Route to default output device
+            if (typeof audioElement.setSinkId === 'function') {
+                audioElement.setSinkId('default')
+                    .then(() => log('Audio sink set to default device'))
+                    .catch(e => log(`setSinkId failed: ${e}`, 'warn'));
+            }
+            
+            // Start playback
+            audioElement.play().then(() => {
+                log('Audio playback confirmed after track attach');
+                updateConnectionStatus('connected', 'Audio Streaming');
+            }).catch(e => {
+                log(`Audio play() failed: ${e}`, 'warn');
+            });
+        }
+    };
+    ```
+
+    ### Audio Autoplay Priming
+
+    ```javascript
+    // From Client/html-server/index.html:573-599
+    document.getElementById('joinButton').addEventListener('click', () => {
+        // Create and arm audio element under user gesture
+        const audioEl = createHiddenAudioElement();
+        try {
+            const p = audioEl.play();
+            if (p && typeof p.then === 'function') {
+                p.then(() => log('Primed dedicated audio element on user gesture'))
+                 .catch(e => log(`Audio priming failed: ${e}`, 'warn'));
+            }
+        } catch (e) {
+            log(`Audio priming threw: ${e}`, 'warn');
+        }
+        
+        // Continue with connection
+        connectToSignalingServer(roomId);
+    });
+    ```
+
+    Primes the audio element during user gesture to bypass autoplay restrictions.
+
+    ### Audio Diagnostics
+
+    ```javascript
+    // From Client/html-server/index.html:829-888
+    function checkAudioStatus() {
+        const video = document.getElementById('hiddenVideo');
+        const audio = hiddenAudioElement;
+        log('=== AUDIO STATUS CHECK ===');
+        
+        // Check video element
+        if (video.srcObject) {
+            const audioTracks = video.srcObject.getAudioTracks();
+            log(`Video element audio tracks: ${audioTracks.length}`);
+            audioTracks.forEach((track, index) => {
+                log(`Track ${index}: enabled=${track.enabled}, muted=${track.muted}, readyState=${track.readyState}`);
+            });
+        }
+        
+        // Check dedicated audio element
+        if (audio && audio.srcObject) {
+            const audioTracks = audio.srcObject.getAudioTracks();
+            log(`Dedicated audio element tracks: ${audioTracks.length}`);
+            audioTracks.forEach((track, index) => {
+                log(`Track ${index}: enabled=${track.enabled}, muted=${track.muted}, readyState=${track.readyState}`);
+            });
+            log(`Audio element - paused: ${audio.paused}, readyState: ${audio.readyState}`);
+        }
+        
+        // Force playback if paused
+        if (video.srcObject && video.paused) {
+            video.play().catch(e => log(`Failed to force video playback: ${e}`, 'error'));
+        }
+        if (audio && audio.srcObject && audio.paused) {
+            audio.play().catch(e => log(`Failed to force audio playback: ${e}`, 'error'));
+        }
+    }
+    ```
+
+    Available via the audio button in the UI for troubleshooting.
+  </Tab>
+
+  <Tab title="Input Forwarding">
+    ## DataChannel-Based Input Forwarding
+
+    ### Keyboard Input
+
+    ```javascript
+    // From Client/html-server/index.html:1507-1538
+    function handleKeyDown(event) {
+        if (!event.code || event.repeat) return;
+        
+        // Handle special keys
+        if (event.key === 'Escape' && (isFullscreen || document.fullscreenElement)) {
+            toggleFullscreen();
+            return;
+        }
+        if (event.key === 'F12') {
+            event.preventDefault();
+            toggleDebug();
+            return;
+        }
+        
+        event.preventDefault();
+        keyState.add(event.code);
+        
+        const keyData = { 
+            key: event.key, 
+            code: event.code, 
+            type: 'keydown', 
+            client_send_time: Date.now() 
+        };
+        sendKeyPress(keyData);
+    }
+    
+    function handleKeyUp(event) {
+        if (!event.code || !keyState.has(event.code)) return;
+        
+        event.preventDefault();
+        keyState.delete(event.code);
+        
+        const keyData = { 
+            key: event.key, 
+            code: event.code, 
+            type: 'keyup', 
+            client_send_time: Date.now() 
+        };
+        sendKeyPress(keyData);
+    }
+    ```
+
+    ### Mouse Input (Throttled)
+
+    ```javascript
+    // From Client/html-server/index.html:1031-1046
+    const throttledSendMouseMove = throttle((event) => {
+        const rect = canvas.getBoundingClientRect();
+        const scaleX = canvas.width / rect.width;
+        const scaleY = canvas.height / rect.height;
+        
+        const mouseData = {
+            type: "mousemove",
+            x: Math.round((event.clientX - rect.left) * scaleX),
+            y: Math.round((event.clientY - rect.top) * scaleY),
+            client_send_time: Date.now(),
+        };
+        
+        sendMouseEvent(mouseData);
+    }, 8);  // Throttle to ~125Hz
+    ```
+
+    ### DataChannel Transmission
+
+    ```javascript
+    // From Client/html-server/index.html:1489-1505
+    function sendKeyPress(keyData) {
+        if (dataChannel && dataChannel.readyState === 'open' && dataChannel.bufferedAmount < 65536) {
+            const message = JSON.stringify(keyData);
+            dataChannel.send(message);
+        } else {
+            console.warn('Data channel not open or buffer full');
+        }
+    }
+    
+    function sendMouseEvent(mouseData) {
+        if (mouseChannel && mouseChannel.readyState === 'open' && mouseChannel.bufferedAmount < 65536) {
+            const message = JSON.stringify(mouseData);
+            mouseChannel.send(message);
+        } else {
+            console.warn('Mouse channel not open or buffer full');
+        }
+    }
+    ```
+
+    ### Input Overlay
+
+    ```html
+    <!-- From Client/html-server/index.html:564 -->
+    <div id="input-overlay"></div>
+    ```
+
+    ```css
+    /* From Client/html-server/index.html:117-125 */
+    #input-overlay {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      z-index: 10;
+      cursor: none;
+    }
+    ```
+
+    Transparent overlay captures input without interfering with video rendering.
+
+    ### Event Listeners
+
+    ```javascript
+    // From Client/html-server/index.html:1638-1648
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+    
+    const inputOverlay = document.getElementById('input-overlay');
+    inputOverlay.addEventListener('mousemove', handleMouseMove);
+    inputOverlay.addEventListener('mousedown', handleMouseDown);
+    inputOverlay.addEventListener('mouseup', handleMouseUp);
+    inputOverlay.addEventListener('contextmenu', handleContextMenu);
+    
+    canvas.addEventListener('dragstart', (e) => e.preventDefault());
+    ```
+  </Tab>
+
+  <Tab title="Matchmaker Integration">
+    ## Automatic Host Discovery
+
+    ### Find Match Flow
+
+    ```javascript
+    // From Client/html-server/index.html:602-665
+    document.getElementById('findMatchButton').addEventListener('click', async () => {
+        const findMatchBtn = document.getElementById('findMatchButton');
+        const matchStatus = document.getElementById('matchStatus');
+        
+        // Disable button while searching
+        findMatchBtn.disabled = true;
+        findMatchBtn.textContent = 'Searching...';
+        matchStatus.textContent = 'Looking for available hosts...';
+        
+        try {
+            // Query matchmaker
+            const response = await fetch(`${matchmakerUrl}/api/match/find`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({}),
+                mode: 'cors'
+            });
+            
+            const data = await response.json();
+            
+            if (data.found) {
+                matchStatus.textContent = `Found host! Connecting to room ${data.roomId}...`;
+                
+                // Prime audio element
+                const audioEl = createHiddenAudioElement();
+                audioEl.play().catch(e => log(`Audio priming failed: ${e}`, 'warn'));
+                
+                // Hide setup UI
+                document.getElementById('roomSetup').classList.add('hidden');
+                document.body.classList.add('immersive');
+                document.getElementById('gameContainer').classList.remove('hidden');
+                
+                // Use returned ICE servers
+                if (Array.isArray(data.iceServers) && data.iceServers.length > 0) {
+                    currentIceServers = data.iceServers;
+                    log(`Using ${data.iceServers.length} ICE server entries from matchmaker`);
+                } else {
+                    currentIceServers = defaultIceServers;
+                    log('Matchmaker returned no ICE servers; falling back to default STUN', 'warn');
+                }
+                
+                // Connect to signaling server
+                connectToSignalingServer(data.roomId, data.signalingUrl);
+            } else {
+                matchStatus.textContent = data.message || 'No hosts available. Try again later.';
+                findMatchBtn.disabled = false;
+                findMatchBtn.textContent = 'Find Match';
+            }
+        } catch (error) {
+            console.error('Matchmaker error:', error);
+            matchStatus.textContent = `Connection failed: ${error.message}`;
+            findMatchBtn.disabled = false;
+            findMatchBtn.textContent = 'Find Match';
+        }
+    });
+    ```
+
+    ### Manual Room Join
+
+    ```javascript
+    // From Client/html-server/index.html:573-599
+    document.getElementById('joinButton').addEventListener('click', () => {
+        const roomId = document.getElementById('roomIdInput').value;
+        if (!roomId) {
+            alert('Please enter a Room ID.');
+            return;
+        }
+        
+        // Prime audio
+        const audioEl = createHiddenAudioElement();
+        audioEl.play().catch(e => log(`Audio priming failed: ${e}`, 'warn'));
+        
+        // Hide setup UI
+        document.getElementById('roomSetup').classList.add('hidden');
+        document.body.classList.add('immersive');
+        document.getElementById('gameContainer').classList.remove('hidden');
+        
+        // Use default ICE servers
+        currentIceServers = defaultIceServers;
+        
+        // Connect directly
+        connectToSignalingServer(roomId);
+    });
+    ```
+
+    ### Environment Detection
+
+    ```javascript
+    // From Client/html-server/index.html:667-679
+    const _isProd = location.hostname !== 'localhost' && location.hostname !== '127.0.0.1';
+    
+    const matchmakerUrl = _isProd
+        ? "https://matchmaker-production-5b36.up.railway.app"  
+        : "http://localhost:3000";
+    
+    const serverUrlBase = _isProd
+        ? "wss://signaling-server-production-acd4.up.railway.app"
+        : "ws://localhost:3002";
+    ```
+
+    Automatically switches between dev and prod URLs.
+  </Tab>
+</Tabs>
+
+## UI Components
+
+### Loading Overlay
+
+```html
+<!-- From Client/html-server/index.html:557-561 -->
+<div class="loading-overlay" id="loadingOverlay">
+  <div class="loading-spinner"></div>
+  <div class="loading-text" id="loadingText">Connecting to Game Server</div>
+  <div class="loading-subtext" id="loadingSubtext">Establishing WebRTC connection...</div>
+</div>
+```
+
+### Performance Overlay
+
+```html
+<!-- From Client/html-server/index.html:531-548 -->
+<div class="performance-overlay" id="perfOverlay">
+  <div class="perf-item">
+    <span>Latency:</span>
+    <span class="perf-value" id="latencyValue">-- ms</span>
+  </div>
+  <div class="perf-item">
+    <span>FPS:</span>
+    <span class="perf-value" id="fpsValue">-- fps</span>
+  </div>
+  <div class="perf-item">
+    <span>Quality:</span>
+    <span class="perf-value" id="qualityValue">--</span>
+  </div>
+  <div class="perf-item">
+    <span>Bitrate:</span>
+    <span class="perf-value" id="bitrateValue">-- kbps</span>
+  </div>
+</div>
+```
+
+### Debug Console
+
+```html
+<!-- From Client/html-server/index.html:569 -->
+<div class="debug-log" id="debugLog"></div>
+```
+
+```javascript
+// From Client/html-server/index.html:984-1008
+function log(message, level = 'info') {
+    console.log(message);
+    
+    const timestamp = new Date().toLocaleTimeString();
+    const logEntry = document.createElement('div');
+    logEntry.className = 'log-entry';
+    logEntry.innerHTML = `
+        <span class="log-timestamp">[${timestamp}]</span>
+        <span class="log-level-${level}">${message}</span>
+    `;
+    
+    debugLog.appendChild(logEntry);
+    debugLog.scrollTop = debugLog.scrollHeight;
+    
+    // Keep last 200 entries
+    if (debugLog.children.length > 200) {
+        debugLog.removeChild(debugLog.firstChild);
+    }
+}
+```
+
+## Key Source Files
+
+<CardGroup cols={2}>
+  <Card title="index.html" icon="browser" href="https://github.com/yourusername/cloudgaming/blob/main/Client/html-server/index.html">
+    Main client application with WebRTC, rendering, and input handling.
+  </Card>
+  
+  <Card title="adapter.js" icon="code" href="https://github.com/webrtcHacks/adapter">
+    WebRTC adapter shim for cross-browser compatibility.
+  </Card>
+</CardGroup>
+
+<Note>
+  **Browser Compatibility:**
+  - Chrome 90+: Full support including `requestVideoFrameCallback`
+  - Firefox 89+: Full support
+  - Safari 15.4+: Limited support (no rVFC)
+  - Edge 90+: Full support (Chromium-based)
+</Note>

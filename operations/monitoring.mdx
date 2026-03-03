@@ -1,0 +1,431 @@
+---
+title: 'Monitoring and Metrics'
+description: 'Comprehensive monitoring for CloudGaming infrastructure'
+---
+
+## Overview
+
+CloudGaming provides multi-layer monitoring across WebRTC streaming, signaling infrastructure, and host health. This guide covers all available metrics, health checks, and monitoring best practices.
+
+## WebRTC Statistics
+
+### Real-Time Transport Metrics
+
+The Go/Pion WebRTC implementation tracks comprehensive transport statistics:
+
+**Packet Loss and Retransmission**
+```go
+// Tracked in gortc_main/main.go:236-245
+type WebRTCStats struct {
+    nackCount        uint32  // NACK (negative acknowledgment) count
+    pliCount         uint32  // Picture Loss Indication count
+    twccCount        uint32  // Transport-wide congestion control count
+    pacerQueueLength uint32  // Pacer queue depth
+    sendBitrateKbps  uint32  // Estimated send bitrate
+}
+```
+
+**Available Metrics:**
+- **Packet Loss** - Percentage of lost RTP packets
+- **RTT (Round-Trip Time)** - Network latency in milliseconds
+- **Jitter** - Packet arrival time variance
+- **NACK Count** - Number of retransmission requests
+- **PLI Count** - Number of keyframe requests
+- **Send Bitrate** - Current video bitrate in kbps
+- **Pacer Queue Length** - Number of frames waiting to send
+
+### Stats Monitoring Implementation
+
+```go
+// Stats updated every 500ms (gortc_main/main.go:248-268)
+func startStatsMonitoring() {
+    ticker := time.NewTicker(500 * time.Millisecond)
+    defer ticker.Stop()
+    
+    audioHealthTicker := time.NewTicker(5 * time.Second)
+    defer audioHealthTicker.Stop()
+    
+    for {
+        select {
+        case <-ticker.C:
+            updatePacerQueueLength()
+        case <-audioHealthTicker.C:
+            reportAudioQueueHealth()
+        }
+    }
+}
+```
+
+### RTCP Feedback
+
+RTCP (RTP Control Protocol) provides real-time feedback:
+
+```go
+// Callback signature (gortc_main/main.go:16-19)
+typedef void (*WebRTCStatsCallback)(
+    double packetLoss, double rtt, double jitter,
+    unsigned int nackCount, unsigned int pliCount, 
+    unsigned int twccCount, unsigned int pacerQueueLength, 
+    unsigned int sendBitrateKbps
+);
+```
+
+**Log Example:**
+```log
+[Go/Pion] WebRTC Stats: loss=0.5%, rtt=28ms, jitter=2.1ms, 
+nack=12, pli=1, bitrate=8500kbps, queue=2
+```
+
+## Audio Queue Monitoring
+
+### Queue Health Metrics
+
+Audio queue depth indicates network congestion:
+
+```go
+// Reported every 5 seconds (gortc_main/main.go:486-532)
+func reportAudioQueueHealth() {
+    avgDepth := getAverageAudioQueueDepth()
+    currentDepth := len(audioSendQueue)
+    
+    healthStatus := "GOOD"
+    if avgDepth > 2.0 {
+        healthStatus = "WARNING"
+    }
+    if avgDepth > 2.8 {
+        healthStatus = "CRITICAL"
+    }
+}
+```
+
+**Health Status Thresholds:**
+- **GOOD**: Average queue depth < 2.0 packets
+- **WARNING**: Average queue depth > 2.0 packets  
+- **CRITICAL**: Average queue depth > 2.8 packets
+
+**Log Example:**
+```log
+[Go/Pion] Audio Queue Health [WARNING]: current=3, avg=2.4, 
+min=1, max=4, samples=10
+[Go/Pion] ⚠️  Audio queue consistently congested - 
+consider bitrate reduction
+```
+
+## Buffer Pool Health
+
+### Memory Management Monitoring
+
+The tiered buffer pool tracks allocation efficiency:
+
+```go
+// Health check (gortc_main/main.go:310-344)
+func checkBufferPoolHealth() {
+    totalHits := sum(sampleBufPool.hits)
+    totalMisses := sum(sampleBufPool.misses)
+    hitRate := float64(totalHits) / float64(totalHits + totalMisses)
+    
+    if hitRate < 85.0 {
+        log.Printf("⚠️  Low hit rate %.1f%%", hitRate)
+    }
+}
+```
+
+**Performance Indicators:**
+- **Hit Rate 95%+**: Excellent - minimal allocations
+- **Hit Rate 90-95%**: Good - some allocations expected
+- **Hit Rate 80-90%**: Moderate - consider pool tuning
+- **Hit Rate below 80%**: Poor - high GC pressure
+
+**Log Example:**
+```log
+[Go/Pion] Buffer Pool Statistics:
+  Tier 4 (4096 bytes): 1523 hits, 12 misses, 12 allocs (99.2% hit rate)
+  Tier 7 (32768 bytes): 8901 hits, 45 misses, 45 allocs (99.5% hit rate)
+  Overall: 15234 requests, 98.7% hit rate, 89 total allocations
+  ✅ Excellent performance - minimal allocations
+```
+
+## Signaling Server Metrics
+
+### Prometheus Metrics Endpoint
+
+The signaling server exposes metrics at `/metrics`:
+
+```bash
+curl http://localhost:3002/metrics
+```
+
+### Available Metrics
+
+**Connection Metrics:**
+```prometheus
+# Active WebSocket connections
+signaling_active_connections 42
+
+# Rooms with local connections  
+signaling_local_rooms 8
+```
+
+**Message Processing:**
+```prometheus
+# Total messages forwarded
+signaling_messages_forwarded_total 15234
+
+# Schema validation rejections
+signaling_schema_rejections_total 3
+
+# Rate limit drops
+signaling_rate_limit_drops_total 12
+
+# Backpressure connection closes
+signaling_backpressure_closes_total 0
+```
+
+**Redis Health:**
+```prometheus
+# Redis connection status (1=up, 0=down)
+signaling_redis_up 1
+
+# Circuit breaker status (1=open, 0=closed)
+signaling_circuit_breaker_open 0
+
+# Redis command latency histogram
+signaling_redis_cmd_latency_seconds_bucket{le="0.005"} 1234
+signaling_redis_cmd_latency_seconds_bucket{le="0.01"} 1240
+signaling_redis_cmd_latency_seconds_bucket{le="0.025"} 1245
+```
+
+**Fanout Performance:**
+```prometheus
+# Local message fanout latency
+signaling_fanout_latency_seconds_bucket{le="0.001"} 5678
+signaling_fanout_latency_seconds_bucket{le="0.005"} 5690
+```
+
+### Implementation Reference
+
+See `Server/metrics.js:1-117` for the complete metrics implementation.
+
+## Matchmaker Monitoring
+
+### Host Health Tracking
+
+The matchmaker monitors host heartbeats:
+
+**Heartbeat Endpoint:**
+```bash
+POST /api/host/heartbeat
+Authorization: Bearer <HOST_SECRET>
+
+{
+  "hostId": "550e8400-e29b-41d4-a716-446655440000",
+  "roomId": "game-room-1",
+  "region": "us-west",
+  "status": "idle",
+  "capacity": 1,
+  "availableSlots": 1
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "ttl": 30
+}
+```
+
+### Host TTL Monitoring
+
+```bash
+GET /api/hosts/ttl
+```
+
+**Response:**
+```json
+[
+  {
+    "hostId": "550e8400-e29b-41d4-a716-446655440000",
+    "ttlSeconds": 28
+  }
+]
+```
+
+**Stale Host Pruning:**
+```javascript
+// Runs every 10 seconds (mm_server/Matchmaker.js:189-206)
+async function pruneStaleIdleHosts() {
+    const stale = [];
+    const ids = await redisClient.sMembers('idle_hosts');
+    for (const id of ids) {
+        const ttl = await redisClient.ttl(`host:${id}`);
+        if (ttl === -2) {  // Key expired
+            stale.push(id);
+        }
+    }
+    if (stale.length > 0) {
+        await redisClient.sRem('idle_hosts', stale);
+    }
+}
+```
+
+## Health Check Endpoints
+
+### Signaling Server
+
+**Liveness Probe:**
+```bash
+GET /healthz
+# Returns: 200 OK
+```
+
+**Readiness Probe:**
+```bash
+GET /readyz
+# Returns: 200 "ready" if Redis is connected
+# Returns: 503 "not-ready" if Redis is down or draining
+```
+
+### Matchmaker
+
+**Health Endpoints:**
+```bash
+GET /healthz   # Liveness
+GET /readyz    # Readiness  
+GET /health    # General health
+GET /          # Returns "ok"
+```
+
+All return `200 OK` immediately to prevent Railway from killing the container.
+
+## Host Configuration Monitoring
+
+Monitor these key settings from `config.json`:
+
+### Video Configuration
+```json
+{
+  "video": {
+    "fps": 60,
+    "bitrateStart": 8000000,
+    "bitrateMin": 8000000,
+    "bitrateMax": 12000000,
+    "preset": "p2",
+    "rc": "cbr"
+  }
+}
+```
+
+### Capture Settings
+```json
+{
+  "capture": {
+    "mmcss": { "enable": true, "priority": 4 },
+    "maxQueueDepth": 2,
+    "skipUnchanged": true
+  }
+}
+```
+
+### Audio Configuration
+```json
+{
+  "audio": {
+    "bitrate": 80000,
+    "frameSizeMs": 10,
+    "enableFec": true,
+    "latency": {
+      "enforceSingleFrameBuffering": true,
+      "targetOneWayLatencyMs": 40
+    }
+  }
+}
+```
+
+## Redis Monitoring
+
+### Circuit Breaker
+
+Protects against Redis failures:
+
+```javascript
+// Server/ScalableSignalingServer.js:68-84
+function noteRedisFailure() {
+    redisFailureCount += 1;
+    if (redisFailureCount >= config.cbErrorThreshold) {
+        redisCircuitOpenUntil = Date.now() + config.cbOpenMs;
+        setCircuitBreakerOpen(true);
+    }
+}
+```
+
+**When circuit opens:**
+- New connections rejected with `1013 Service unavailable`
+- Existing connections continue working
+- Circuit auto-closes after timeout
+
+### Connection Status
+
+```javascript
+// Check Redis connectivity
+const pong = await redisClient.ping();
+if (pong === 'PONG') {
+    // Redis is healthy
+}
+```
+
+## Monitoring Best Practices
+
+### Alerting Thresholds
+
+**Critical Alerts:**
+- WebRTC packet loss > 5%
+- RTT > 150ms for sustained period
+- Audio queue depth > 2.8 (CRITICAL)
+- Buffer pool hit rate < 80%
+- Redis circuit breaker open
+- Signaling server Redis disconnected
+
+**Warning Alerts:**
+- WebRTC packet loss > 2%
+- RTT > 100ms
+- Audio queue depth > 2.0 (WARNING)
+- Buffer pool hit rate < 90%
+- Host heartbeat TTL < 10 seconds
+- Rate limit drops increasing
+
+### Log Aggregation
+
+**Key Log Patterns:**
+```bash
+# WebRTC stats
+grep "WebRTC Stats" logs.txt
+
+# Audio health
+grep "Audio Queue Health" logs.txt
+
+# Buffer pool performance
+grep "Buffer Pool" logs.txt
+
+# Redis errors
+grep "Redis" logs.txt | grep -E "error|failed"
+
+# Connection issues
+grep -E "ICE|connection state" logs.txt
+```
+
+### Grafana Dashboard Example
+
+**Panels to Include:**
+1. Active connections (signaling_active_connections)
+2. Message throughput (rate(signaling_messages_forwarded_total[1m]))
+3. Redis latency (signaling_redis_cmd_latency_seconds)
+4. WebRTC packet loss percentage
+5. Audio queue depth over time
+6. Buffer pool hit rate
+7. Host heartbeat count
+
+## Next Steps
+
+- [Performance Tuning](/operations/performance-tuning) - Optimize metrics based on monitoring data
+- [Troubleshooting](/operations/troubleshooting) - Debug issues found in monitoring

@@ -1,0 +1,155 @@
+---
+title: Configuration Overview
+description: Complete guide to CloudGaming configuration structure and config.json
+---
+
+## Configuration Structure
+
+CloudGaming uses a `config.json` file that must be present in the host application's working directory. The configuration is divided into two main sections:
+
+- **client** - Browser client configuration for signaling and matchmaking
+- **host** - Host application configuration for capture, encoding, audio, input, and networking
+
+## config.json Location
+
+The configuration file must be located in the same directory as the host executable:
+
+```
+DisplayCaptureProject.exe
+config.json  ← must be here
+```
+
+## Configuration Sections
+
+<CardGroup cols={2}>
+  <Card title="Video Encoding" icon="video" href="/configuration/video">
+    Frame rate, bitrate, NVENC presets, HDR tone mapping
+  </Card>
+  <Card title="Audio Capture" icon="microphone" href="/configuration/audio">
+    Process loopback, Opus encoding, WASAPI settings
+  </Card>
+  <Card title="Input Injection" icon="keyboard" href="/configuration/input">
+    Mouse/keyboard policies, DataChannels, thread priority
+  </Card>
+  <Card title="Screen Capture" icon="desktop" href="/configuration/capture">
+    WGC capture, copy pools, frame queuing, MMCSS
+  </Card>
+  <Card title="Network" icon="network-wired" href="/configuration/network">
+    Signaling servers, matchmaker, ICE/TURN setup
+  </Card>
+</CardGroup>
+
+## Basic Structure
+
+```json
+{
+  "client": {
+    "serverUrlBase": "wss://signaling-server.example.com",
+    "matchmakerUrl": "https://matchmaker.example.com"
+  },
+  "host": {
+    "targetProcessName": "Game.exe",
+    "signalingUrl": "wss://signaling-server.example.com",
+    "matchmaker": { ... },
+    "window": { ... },
+    "video": { ... },
+    "capture": { ... },
+    "audio": { ... },
+    "input": { ... },
+    "debug": { ... }
+  }
+}
+```
+
+## Client Configuration
+
+The client section configures browser client connection endpoints.
+
+<ParamField path="client.serverUrlBase" type="string" required>
+  WebSocket URL for the signaling server. Must use `wss://` protocol for secure connections.
+  
+  **Default:** `wss://signaling-server-production-acd4.up.railway.app`
+</ParamField>
+
+<ParamField path="client.matchmakerUrl" type="string" required>
+  HTTP(S) URL for the matchmaker service that assigns clients to available hosts.
+  
+  **Default:** `https://matchmaker-production-5b36.up.railway.app`
+</ParamField>
+
+## Host Configuration
+
+### Target Process
+
+<ParamField path="host.targetProcessName" type="string" required>
+  Name of the executable to capture (e.g., `SandFall-Win64-Shipping.exe`).
+  
+  This process will be the target for screen capture and input injection.
+</ParamField>
+
+<ParamField path="host.signalingUrl" type="string" required>
+  WebSocket URL for host-to-signaling-server connection.
+  
+  **Default:** `wss://signaling-server-production-acd4.up.railway.app`
+</ParamField>
+
+### Window Configuration
+
+<ParamField path="host.window.resizeClientArea" type="boolean" default="true">
+  Automatically resize the target window's client area to match target dimensions.
+</ParamField>
+
+<ParamField path="host.window.targetWidth" type="integer" default="1920">
+  Target window width in pixels.
+</ParamField>
+
+<ParamField path="host.window.targetHeight" type="integer" default="1080">
+  Target window height in pixels.
+</ParamField>
+
+### Debug Options
+
+<ParamField path="host.debug.enableWAVRecording" type="boolean" default="false">
+  Enable raw audio capture recording to WAV file for debugging.
+  
+  <Warning>This will create large files and impact performance. Use only for debugging.</Warning>
+</ParamField>
+
+<ParamField path="host.debug.wavFilename" type="string" default="output.wav">
+  Output filename for WAV recording when enabled.
+</ParamField>
+
+## Best Practices
+
+<Tip>
+  Start with the default configuration and adjust settings incrementally based on your specific requirements and network conditions.
+</Tip>
+
+### Performance Tuning
+
+1. **Low Latency Priority**: Set `video.bf` to `0`, use `video.rc` as `cbr`, enable `audio.latency.strictLatencyMode`
+2. **High Quality Priority**: Increase `video.bitrateMax`, use slower `video.preset` (p5-p7), increase `audio.bitrate`
+3. **Network Constrained**: Lower `video.bitrateStart`, enable adaptive bitrate controllers
+
+### Production Deployment
+
+<Warning>
+  Always use secure WebSocket connections (`wss://`) and HTTPS (`https://`) in production deployments.
+</Warning>
+
+- Use production-grade signaling servers with Redis clustering
+- Configure TURN servers for NAT traversal
+- Set appropriate `hostSecret` for matchmaker authentication
+- Enable MMCSS for capture and input threads
+- Test with your target applications and network conditions
+
+## Configuration Validation
+
+The host application will validate the configuration on startup and log errors for:
+
+- Missing required fields
+- Invalid value ranges
+- Incompatible setting combinations
+- Missing dependencies (e.g., NVENC on non-NVIDIA GPUs)
+
+Check the console output for configuration warnings and errors before starting a streaming session.

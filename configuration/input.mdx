@@ -1,0 +1,511 @@
+---
+title: Input Injection Configuration
+description: Configure keyboard and mouse input handling, DataChannels, and thread priority
+---
+
+## Overview
+
+The `host.input` section controls how keyboard and mouse input from the remote client is injected into the target application, including injection policies, transport mechanisms, and thread priority settings.
+
+## Injection Policy
+
+<ParamField path="input.injectionPolicy" type="string" default="REQUIRE_FOREGROUND">
+  Policy for when input injection is allowed.
+  
+  **Default:** `REQUIRE_FOREGROUND`
+  
+  **Options:**
+  - `REQUIRE_FOREGROUND` - Only inject when target window is foreground
+  - `ALWAYS` - Always inject regardless of focus
+  - `DISABLED` - Disable input injection
+  
+  <Warning>Using `ALWAYS` may cause input to be injected into unintended applications.</Warning>
+</ParamField>
+
+<ParamField path="input.allowFocusSteal" type="boolean" default="false">
+  Allow stealing focus from other windows.
+  
+  **Default:** `false`
+  
+  When enabled, automatically brings target window to foreground when input is received.
+</ParamField>
+
+<ParamField path="input.releaseAllOnDisconnect" type="boolean" default="true">
+  Release all pressed keys/buttons when client disconnects.
+  
+  **Default:** `true`
+  
+  Prevents stuck keys when client disconnects unexpectedly.
+  
+  <Tip>Always keep this enabled to avoid stuck key issues.</Tip>
+</ParamField>
+
+## Mouse Configuration
+
+<ParamField path="input.mousePolicy" type="string" default="DPI_AWARE">
+  Mouse coordinate scaling policy.
+  
+  **Default:** `DPI_AWARE`
+  
+  **Options:**
+  - `DPI_AWARE` - Scale coordinates based on system DPI
+  - `ABSOLUTE` - Use absolute coordinates without scaling
+  - `RELATIVE` - Use relative mouse movements
+  
+  `DPI_AWARE` is recommended for accurate cursor positioning across different display configurations.
+</ParamField>
+
+<ParamField path="input.clipCursorToTarget" type="boolean" default="false">
+  Confine cursor to target window boundaries.
+  
+  **Default:** `false`
+  
+  When enabled, prevents cursor from leaving the target window.
+</ParamField>
+
+<ParamField path="input.coalesceMouseMoves" type="boolean" default="true">
+  Combine multiple mouse move events into single injection.
+  
+  **Default:** `true`
+  
+  Reduces CPU usage by batching rapid mouse movements.
+</ParamField>
+
+<ParamField path="input.maxMouseMovesPerFrame" type="integer" default="100">
+  Maximum mouse move events to process per frame.
+  
+  **Default:** `100`
+  
+  Limits processing overhead from rapid mouse movement.
+</ParamField>
+
+<ParamField path="input.enableMouseSequencing" type="boolean" default="false">
+  Enable strict ordering of mouse events.
+  
+  **Default:** `false`
+  
+  May add latency but ensures exact event ordering.
+</ParamField>
+
+## Keyboard Configuration
+
+<ParamField path="input.blockWinKeys" type="boolean" default="true">
+  Block Windows key presses on the host.
+  
+  **Default:** `true`
+  
+  Prevents accidentally opening Start menu or triggering Windows shortcuts during streaming.
+  
+  <Tip>Keep enabled to avoid interruptions during gaming sessions.</Tip>
+</ParamField>
+
+<ParamField path="input.blockSystemKeys" type="boolean" default="false">
+  Block all system key combinations (Alt+Tab, Ctrl+Alt+Del, etc.).
+  
+  **Default:** `false`
+  
+  <Warning>Only enable in controlled environments. Makes it difficult to exit the application.</Warning>
+</ParamField>
+
+<ParamField path="input.repeatPolicy" type="string" default="THROTTLED">
+  Key repeat handling policy.
+  
+  **Default:** `THROTTLED`
+  
+  **Options:**
+  - `THROTTLED` - Limit repeat rate to `maxKeyRepeatHz`
+  - `PASSTHROUGH` - Forward all repeats from client
+  - `DISABLED` - Ignore all key repeats
+  
+  Throttled mode prevents network flooding from held keys.
+</ParamField>
+
+<ParamField path="input.maxKeyRepeatHz" type="integer" default="30">
+  Maximum key repeat frequency in Hz when throttled.
+  
+  **Default:** `30` Hz
+  
+  Standard keyboard repeat rate is ~30 Hz.
+</ParamField>
+
+<ParamField path="input.keyRepeatDelayMs" type="integer" default="250">
+  Initial delay before key repeat starts.
+  
+  **Default:** `250` ms
+  
+  Matches standard OS keyboard repeat delay.
+</ParamField>
+
+## Transport Configuration
+
+<ParamField path="input.usePionDataChannels" type="boolean" default="true">
+  Use WebRTC DataChannels for input transport.
+  
+  **Default:** `true`
+  
+  DataChannels provide lower latency than WebSocket. Only disable for compatibility.
+  
+  <Tip>Always use DataChannels for best performance.</Tip>
+</ParamField>
+
+<ParamField path="input.enableLegacyWebSocket" type="boolean" default="false">
+  Enable fallback WebSocket transport.
+  
+  **Default:** `false`
+  
+  Only needed for clients that don't support DataChannels.
+</ParamField>
+
+<ParamField path="input.maxPendingMessages" type="integer" default="100">
+  Maximum queued input messages before dropping.
+  
+  **Default:** `100`
+  
+  Prevents memory buildup when injection falls behind.
+</ParamField>
+
+## Injection Rate Limiting
+
+<ParamField path="input.maxInjectHz" type="integer" default="10000">
+  Maximum input injection rate in Hz.
+  
+  **Default:** `10000` Hz (10 kHz)
+  
+  Absolute maximum rate for all input events combined.
+</ParamField>
+
+<ParamField path="input.inputQueueTimeoutMs" type="integer" default="10">
+  Timeout for input queue processing.
+  
+  **Default:** `10` ms
+</ParamField>
+
+## Error Handling and Recovery
+
+<ParamField path="input.enableStuckKeyRecovery" type="boolean" default="true">
+  Automatically detect and release stuck keys.
+  
+  **Default:** `true`
+  
+  Monitors for keys that remain pressed longer than timeout.
+</ParamField>
+
+<ParamField path="input.stuckKeyTimeoutMs" type="integer" default="2000">
+  Time in milliseconds before a key is considered stuck.
+  
+  **Default:** `2000` ms (2 seconds)
+</ParamField>
+
+<ParamField path="input.enableSequenceRecovery" type="boolean" default="true">
+  Recover from input sequence errors.
+  
+  **Default:** `true`
+  
+  Attempts to resynchronize input state after errors.
+</ParamField>
+
+<ParamField path="input.maxRecoveryAttempts" type="integer" default="3">
+  Maximum recovery attempts before giving up.
+  
+  **Default:** `3`
+</ParamField>
+
+<ParamField path="input.strictErrorHandling" type="boolean" default="false">
+  Stop processing on first injection error.
+  
+  **Default:** `false`
+  
+  When false, continues processing despite occasional errors.
+</ParamField>
+
+<ParamField path="input.logInjectionErrors" type="boolean" default="true">
+  Log input injection errors.
+  
+  **Default:** `true`
+</ParamField>
+
+<ParamField path="input.maxConsecutiveErrors" type="integer" default="10">
+  Maximum consecutive errors before stopping injection.
+  
+  **Default:** `10`
+</ParamField>
+
+## Logging
+
+<ParamField path="input.enablePerEventLogging" type="boolean" default="false">
+  Log every individual input event.
+  
+  **Default:** `false`
+  
+  <Warning>Generates massive log output. Only enable for debugging specific issues.</Warning>
+</ParamField>
+
+<ParamField path="input.enableAggregatedLogging" type="boolean" default="true">
+  Log aggregated input statistics.
+  
+  **Default:** `true`
+  
+  Periodically logs summary statistics (events/sec, errors, etc.).
+</ParamField>
+
+<ParamField path="input.logIntervalMs" type="integer" default="60000">
+  Interval for aggregated logging in milliseconds.
+  
+  **Default:** `60000` ms (1 minute)
+</ParamField>
+
+## Thread Priority (MMCSS)
+
+Multimedia Class Scheduler Service (MMCSS) settings for input thread priority.
+
+<ParamField path="input.threadPriority.enableMMCSS" type="boolean" default="true">
+  Enable MMCSS thread priority boosting.
+  
+  **Default:** `true`
+  
+  MMCSS gives real-time priority to reduce input latency.
+  
+  <Tip>Keep enabled for lowest input latency in gaming scenarios.</Tip>
+</ParamField>
+
+<ParamField path="input.threadPriority.mmcssClass" type="string" default="Games">
+  MMCSS task class name.
+  
+  **Default:** `Games`
+  
+  **Options:** `Games`, `Audio`, `Capture`, `Distribution`, `Playback`, `Pro Audio`, `Window Manager`
+  
+  `Games` class provides optimal priority for gaming input.
+</ParamField>
+
+<ParamField path="input.threadPriority.enableTimeCritical" type="boolean" default="true">
+  Use time-critical priority level.
+  
+  **Default:** `true`
+  
+  Maximum priority short of real-time kernel threads.
+</ParamField>
+
+<ParamField path="input.threadPriority.threadPriority" type="integer" default="15">
+  Win32 thread priority level.
+  
+  **Default:** `15` (TIME_CRITICAL)
+  
+  Range: -15 (IDLE) to 15 (TIME_CRITICAL)
+</ParamField>
+
+<ParamField path="input.threadPriority.taskName" type="string" default="InputInjection">
+  MMCSS task name for tracking.
+  
+  **Default:** `InputInjection`
+</ParamField>
+
+<ParamField path="input.threadPriority.fallbackToWin32Priority" type="boolean" default="true">
+  Fall back to Win32 priority if MMCSS fails.
+  
+  **Default:** `true`
+  
+  Ensures elevated priority even if MMCSS is unavailable.
+</ParamField>
+
+<ParamField path="input.threadPriority.showDiagnosticsOnFailure" type="boolean" default="true">
+  Show diagnostics if priority elevation fails.
+  
+  **Default:** `true`
+</ParamField>
+
+<ParamField path="input.threadPriority.retryMMCSSOnFailure" type="boolean" default="false">
+  Retry MMCSS registration on failure.
+  
+  **Default:** `false`
+</ParamField>
+
+<ParamField path="input.threadPriority.mmcssRetryDelayMs" type="integer" default="1000">
+  Delay between MMCSS retry attempts.
+  
+  **Default:** `1000` ms
+</ParamField>
+
+## Adaptive Quality Control
+
+Adaptive input dropping based on network conditions.
+
+<ParamField path="input.adaptiveQualityControl.enableAdaptiveDropping" type="boolean" default="true">
+  Enable adaptive input event dropping during congestion.
+  
+  **Default:** `true`
+  
+  Drops low-priority input events when network quality degrades.
+</ParamField>
+
+<ParamField path="input.adaptiveQualityControl.rttExcellentThreshold" type="float" default="10.0">
+  RTT threshold for excellent network quality (ms).
+  
+  **Default:** `10.0` ms
+</ParamField>
+
+<ParamField path="input.adaptiveQualityControl.rttGoodThreshold" type="float" default="50.0">
+  RTT threshold for good network quality (ms).
+  
+  **Default:** `50.0` ms
+</ParamField>
+
+<ParamField path="input.adaptiveQualityControl.rttFairThreshold" type="float" default="100.0">
+  RTT threshold for fair network quality (ms).
+  
+  **Default:** `100.0` ms
+</ParamField>
+
+<ParamField path="input.adaptiveQualityControl.rttPoorThreshold" type="float" default="200.0">
+  RTT threshold for poor network quality (ms).
+  
+  **Default:** `200.0` ms
+</ParamField>
+
+<ParamField path="input.adaptiveQualityControl.lossExcellentThreshold" type="float" default="0.01">
+  Packet loss threshold for excellent quality.
+  
+  **Default:** `0.01` (1%)
+</ParamField>
+
+<ParamField path="input.adaptiveQualityControl.lossGoodThreshold" type="float" default="0.05">
+  Packet loss threshold for good quality.
+  
+  **Default:** `0.05` (5%)
+</ParamField>
+
+<ParamField path="input.adaptiveQualityControl.lossFairThreshold" type="float" default="0.10">
+  Packet loss threshold for fair quality.
+  
+  **Default:** `0.10` (10%)
+</ParamField>
+
+<ParamField path="input.adaptiveQualityControl.lossPoorThreshold" type="float" default="0.20">
+  Packet loss threshold for poor quality.
+  
+  **Default:** `0.20` (20%)
+</ParamField>
+
+<ParamField path="input.adaptiveQualityControl.queueExcellentThreshold" type="integer" default="1">
+  Input queue depth for excellent quality.
+  
+  **Default:** `1`
+</ParamField>
+
+<ParamField path="input.adaptiveQualityControl.queueGoodThreshold" type="integer" default="3">
+  Input queue depth for good quality.
+  
+  **Default:** `3`
+</ParamField>
+
+<ParamField path="input.adaptiveQualityControl.queueFairThreshold" type="integer" default="6">
+  Input queue depth for fair quality.
+  
+  **Default:** `6`
+</ParamField>
+
+<ParamField path="input.adaptiveQualityControl.queuePoorThreshold" type="integer" default="12">
+  Input queue depth for poor quality.
+  
+  **Default:** `12`
+</ParamField>
+
+<ParamField path="input.adaptiveQualityControl.excellentDropRatio" type="float" default="0.0">
+  Input drop ratio for excellent quality (0.0-1.0).
+  
+  **Default:** `0.0` (no dropping)
+</ParamField>
+
+<ParamField path="input.adaptiveQualityControl.goodDropRatio" type="float" default="0.0">
+  Input drop ratio for good quality (0.0-1.0).
+  
+  **Default:** `0.0` (no dropping)
+</ParamField>
+
+<ParamField path="input.adaptiveQualityControl.fairDropRatio" type="float" default="0.0">
+  Input drop ratio for fair quality (0.0-1.0).
+  
+  **Default:** `0.0` (no dropping)
+</ParamField>
+
+<ParamField path="input.adaptiveQualityControl.poorDropRatio" type="float" default="0.0">
+  Input drop ratio for poor quality (0.0-1.0).
+  
+  **Default:** `0.0` (no dropping)
+</ParamField>
+
+<ParamField path="input.adaptiveQualityControl.criticalDropRatio" type="float" default="0.0">
+  Input drop ratio for critical quality (0.0-1.0).
+  
+  **Default:** `0.0` (no dropping)
+</ParamField>
+
+<ParamField path="input.adaptiveQualityControl.minFrameIntervalMs" type="integer" default="0">
+  Minimum interval between input frames (ms).
+  
+  **Default:** `0` (no throttling)
+</ParamField>
+
+<ParamField path="input.adaptiveQualityControl.statsUpdateIntervalMs" type="integer" default="100">
+  Network statistics update interval (ms).
+  
+  **Default:** `100` ms
+</ParamField>
+
+## Example Configurations
+
+### Competitive Gaming (Ultra-Low Latency)
+
+```json
+{
+  "input": {
+    "blockWinKeys": true,
+    "injectionPolicy": "REQUIRE_FOREGROUND",
+    "mousePolicy": "DPI_AWARE",
+    "coalesceMouseMoves": false,
+    "usePionDataChannels": true,
+    "threadPriority": {
+      "enableMMCSS": true,
+      "mmcssClass": "Games",
+      "enableTimeCritical": true
+    },
+    "adaptiveQualityControl": {
+      "enableAdaptiveDropping": false
+    }
+  }
+}
+```
+
+### Casual Gaming (Balanced)
+
+```json
+{
+  "input": {
+    "blockWinKeys": true,
+    "injectionPolicy": "REQUIRE_FOREGROUND",
+    "mousePolicy": "DPI_AWARE",
+    "coalesceMouseMoves": true,
+    "repeatPolicy": "THROTTLED",
+    "maxKeyRepeatHz": 30,
+    "usePionDataChannels": true
+  }
+}
+```
+
+### High Latency Network
+
+```json
+{
+  "input": {
+    "coalesceMouseMoves": true,
+    "maxMouseMovesPerFrame": 50,
+    "repeatPolicy": "THROTTLED",
+    "maxKeyRepeatHz": 20,
+    "adaptiveQualityControl": {
+      "enableAdaptiveDropping": true,
+      "fairDropRatio": 0.2,
+      "poorDropRatio": 0.5
+    }
+  }
+}
+```
